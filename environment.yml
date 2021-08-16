@@ -1,0 +1,22 @@
+name: refit_fvs
+
+channels:
+  - conda-forge
+
+dependencies:
+  - emcee
+  - geopandas
+  - jinja2
+  - jupyterlab
+  - matplotlib
+  - pandas
+  - pip
+  - python
+  - scikit-learn
+  - scikit-optimize
+  - seaborn
+  - sqlalchemy
+  - tqdm
+  - xlrd
+
+prefix: /users/ddiaz/miniconda3/refit_fvs
