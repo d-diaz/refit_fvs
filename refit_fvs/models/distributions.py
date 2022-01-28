@@ -1,6 +1,7 @@
 from jax import numpy as jnp
 from jax import random, lax
-from numpyro.distributions.util import is_prng_key, promote_shapes
+from numpyro.distributions.util import (is_prng_key, promote_shapes,
+                                        validate_sample)
 from numpyro.distributions import constraints, Normal
 from numpyro.distributions.distribution import Distribution
 
