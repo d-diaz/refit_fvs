@@ -11,7 +11,7 @@ class AsymmetricLaplace(Distribution):
     regression."""
 
     arg_constraints = {"loc": constraints.real, "scale": constraints.positive,
-                       "quantile": constraints.interval(0.,1.)}
+                       "quantile": constraints.interval(0., 1.)}
     support = constraints.real
     reparametrized_params = ["loc", "scale"]
 
@@ -27,7 +27,7 @@ class AsymmetricLaplace(Distribution):
     def log_prob(self, y):
         # following Yu and Moyeed (2001)
         if self._validate_args:
-            self._validate_sample(value)
+            self._validate_sample(y)
 
         µ, σ, p = self.loc, self.scale, self.quantile
         const = p*(1-p)/σ
@@ -70,11 +70,9 @@ class NegativeHalfNormal(Distribution):
             batch_shape=jnp.shape(scale), validate_args=validate_args
         )
 
-
     def sample(self, key, sample_shape=()):
         assert is_prng_key(key)
         return -jnp.abs(self._normal.sample(key, sample_shape))
-
 
     @validate_sample
     def log_prob(self, value):
@@ -83,10 +81,8 @@ class NegativeHalfNormal(Distribution):
     def cdf(self, value):
         return self._normal.cdf(value) * 2
 
-
     def icdf(self, q):
         return -self._normal.icdf((q + 1) / 2)
-
 
     @property
     def mean(self):
