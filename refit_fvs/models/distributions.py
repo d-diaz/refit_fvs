@@ -24,14 +24,14 @@ class AsymmetricLaplace(Distribution):
             batch_shape=batch_shape, validate_args=validate_args
         )
 
-    def log_prob(self, y):
+    def log_prob(self, value):
         # following Yu and Moyeed (2001)
         if self._validate_args:
             self._validate_sample(y)
 
         µ, σ, p = self.loc, self.scale, self.quantile
         const = p*(1-p)/σ
-        z = (y - µ)/σ
+        z = (value - µ)/σ
         check = z * jnp.where(y <= µ, -(1-p), p)
         return jnp.log(const*jnp.exp(-check))
 
@@ -53,6 +53,20 @@ class AsymmetricLaplace(Distribution):
     def variance(self):
         σ, p = self.scale, self.quantile
         return (1-2*p+2*p**2)/(p**2*(1-p)**2) * σ**2
+
+    def cdf(self, value):
+        # defined by Yu and Zhang 2005
+        µ, σ, p = self.loc, self.scale, self.quantile
+        return jnp.where(value <= µ,
+                         p * jnp.exp(((1-p)/σ)*(value-µ)),
+                         1 - (1-p) * jnp.exp(-p/σ*(value-µ)))
+
+    def icdf(self, value):
+        # defined by Yu and Zhang 2005
+        µ, σ, p = self.loc, self.scale, self.quantile
+        return jnp.where(value <= p,
+                         µ + σ/(1-p) * jnp.log(value/p),
+                         µ - σ/p * jnp.log((1-value)/(1-p)))
 
 
 class NegativeHalfNormal(Distribution):
