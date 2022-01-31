@@ -27,12 +27,12 @@ class AsymmetricLaplace(Distribution):
     def log_prob(self, value):
         # following Yu and Moyeed (2001)
         if self._validate_args:
-            self._validate_sample(y)
+            self._validate_sample(value)
 
         µ, σ, p = self.loc, self.scale, self.quantile
         const = p*(1-p)/σ
         z = (value - µ)/σ
-        check = z * jnp.where(y <= µ, -(1-p), p)
+        check = z * jnp.where(value <= µ, -(1-p), p)
         return jnp.log(const*jnp.exp(-check))
 
     def sample(self, key, sample_shape=()):
