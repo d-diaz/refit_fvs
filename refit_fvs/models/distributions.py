@@ -4,9 +4,10 @@ from numpyro.distributions.util import (is_prng_key, promote_shapes,
                                         validate_sample)
 from numpyro.distributions import constraints, Normal
 from numpyro.distributions.distribution import Distribution
+from jax.scipy.special import gammaln, gammainc
 
 
-class AsymmetricLaplace(Distribution):
+class AsymmetricLaplaceQuantile(Distribution):
     """Asymmetric version of the Laplace Distribution, intended for quantile
     regression."""
 
@@ -105,3 +106,49 @@ class NegativeHalfNormal(Distribution):
     @property
     def variance(self):
         return (1 - 2 / jnp.pi) * self.scale ** 2
+
+
+class NegativeGamma(Distribution):
+    arg_constraints = {
+        "concentration": constraints.less_than(0),
+        "rate": constraints.positive,
+    }
+    support = constraints.less_than(0)
+    reparametrized_params = ["concentration", "rate"]
+
+    def __init__(self, concentration, rate=1.0, validate_args=None):
+        self.concentration, self.rate = promote_shapes(concentration, rate)
+        batch_shape = lax.broadcast_shapes(jnp.shape(concentration),
+                                           jnp.shape(rate))
+        super(NegativeGamma, self).__init__(
+            batch_shape=batch_shape, validate_args=validate_args
+        )
+
+    def sample(self, key, sample_shape=()):
+        assert is_prng_key(key)
+        shape = sample_shape + self.batch_shape + self.event_shape
+        return -random.gamma(key, -self.concentration, shape=shape) / self.rate
+
+    @validate_sample
+    def log_prob(self, value):
+        concentration = -self.concentration
+        value = -value
+        normalize_term = gammaln(concentration) - concentration * jnp.log(
+            self.rate
+        )
+        return (
+            (concentration-1) * jnp.log(value)
+            - self.rate * value
+            - normalize_term
+        )
+
+    @property
+    def mean(self):
+        return self.concentration / self.rate
+
+    @property
+    def variance(self):
+        return -self.concentration / jnp.power(self.rate, 2)
+
+    def cdf(self, x):
+        return 1 - gammainc(-self.concentration, self.rate * -x)
