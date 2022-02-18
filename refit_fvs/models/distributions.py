@@ -21,7 +21,7 @@ class AsymmetricLaplaceQuantile(Distribution):
                                                              quantile)
         batch_shape = lax.broadcast_shapes(jnp.shape(loc), jnp.shape(scale),
                                            jnp.shape(quantile))
-        super(AsymmetricLaplace, self).__init__(
+        super(AsymmetricLaplaceQuantile, self).__init__(
             batch_shape=batch_shape, validate_args=validate_args
         )
 
