@@ -5,18 +5,16 @@ channels:
 
 dependencies:
   - arviz
-  - nvidia::cuda-nvcc
   # - earthengine-api
   - geopandas
   - ipywidgets
-  - jax
   - jinja2
   - jupyterlab
   - matplotlib
+  - numpyro
   - pandas
   - pip
   - pip:
-      - numpyro[cuda] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
       - -e .  # install local refit_fvs package in editable mode
   - psycopg2
   - pvlib-python
