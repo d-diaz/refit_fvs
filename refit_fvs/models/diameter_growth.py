@@ -8,11 +8,11 @@ from refit_fvs.models.distributions import NegativeGamma, NegativeHalfNormal
 
 def wykoff_model(X, num_steps, bark_b1, bark_b2,
                  num_variants, num_locations, num_plots, 
-                 y=None, pooling='unpooled'):
-    """A recursive model that predicts basal area increment for individual trees
-    following the general form of Wykoff (1990), with annualization inspired
-    by Cao (2000, 2004), and mixed model approach illustrated by Weiskittel
-    et al., (2007). 
+                 y=None, target='bai', pooling='unpooled'):
+    """A recursive model that predicts diameter growth or basal area increment 
+    for individual trees following the general form of Wykoff (1990), with 
+    annualization inspired by Cao (2000, 2004), and mixed effects approach 
+    illustrated by Weiskittel et al., (2007). 
     
     The Wykoff model employs a linear model to predict the log of the
     difference between squared inside-bark diameter from one timestep to the 
@@ -45,8 +45,6 @@ def wykoff_model(X, num_steps, bark_b1, bark_b2,
           13. competition_standlevel_end
     num_steps : int
       number of steps (or cycles) of growth to simulate
-    y : scalar or list-like
-      observed outside-bark diameter growth
     bark_b1, bark_b2 : scalar
       coefficients used to convert diameter outside bark to diameter inside 
       bark, as DIB = b1*(DBH**b2)
@@ -55,7 +53,11 @@ def wykoff_model(X, num_steps, bark_b1, bark_b2,
     num_locations : int
       number of distinct locations across dataset, modeled as a random effect
     num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
+      number of distinct plots across dataset, modeled as a random effect  
+    y : scalar or list-like
+      observed values for target (basal area increment or diameter growth)
+    target : str
+      type of target variable, may be 'bai' or 'dg'
     pooling : str
       degree of pooling for model covariates across variants/ecoregions, valid
       are 'unpooled', 'pooled', or 'partial'. 
@@ -156,17 +158,13 @@ def wykoff_model(X, num_steps, bark_b1, bark_b2,
 
     adjust = (b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8)
     b0 = numpyro.deterministic('b0', b0z - adjust)
-    
-    eloc_mu = numpyro.sample('eloc_mu', dist.Normal(0., 0.5))
-    eloc_sd = numpyro.sample('eloc_sd', dist.HalfNormal(1.0))
+
     with numpyro.plate('locations', num_locations):
-        eloc = numpyro.sample('eloc', dist.Normal(eloc_mu, eloc_sd)) # random effect of location
+        eloc = numpyro.sample('eloc', dist.Normal(0, 1.0)) # random effect of location
     
     if y is not None:
-        eplot_mu = numpyro.sample('eplot_mu', dist.Normal(0., 0.5))
-        eplot_sd = numpyro.sample('eplot_sd', dist.HalfNormal(1.0))
         with numpyro.plate('plots', num_plots):
-            eplot = numpyro.sample('eplot', dist.Normal(eplot_mu, eplot_sd)) # random effect of plot
+            eplot = numpyro.sample('eplot', dist.Normal(0, 1.0)) # random effect of plot
     else:
         eplot = 0 * plot
 
@@ -206,28 +204,50 @@ def wykoff_model(X, num_steps, bark_b1, bark_b2,
         
     step_covars = (crown_ratio, comp_tree, comp_stand)
     dbh_end, growth = scan(step, dbh, step_covars, length=num_steps)
+    dg_pred = numpyro.deterministic('dg_pred', dbh_end - dbh)
     bai_pred = numpyro.deterministic('bai_pred', jnp.pi/4*(dbh_end**2 - dbh**2))
-    
-    etree = numpyro.sample('etree', dist.Gamma(4.0, 0.1))
 
     with numpyro.plate('plate_obs', size=num_trees):        
-        obs = numpyro.sample('obs', dist.Cauchy(bai_pred, etree), obs=y)
+        if target.lower() == 'bai':
+            etree_bai = numpyro.sample('etree_bai', dist.Gamma(4.0, 0.1))
+            obs = numpyro.sample('obs', dist.Cauchy(bai_pred, etree_bai), obs=y)
+        elif target.lower() == 'dg':
+            etree_dg = numpyro.sample('etree_dg', dist.InverseGamma(2.0, 0.25))
+            obs = numpyro.sample('obs', dist.Cauchy(dg_pred, etree_dg), obs=y)
     
     if y is not None:
-        err = numpyro.sample('err', dist.Cauchy(0, etree))
-        resid = numpyro.deterministic('resid', bai_pred + err - y)
-        bias = numpyro.deterministic('bias', resid.mean())
-        mae = numpyro.deterministic('mae', jnp.abs(resid).mean())
-        rmse = numpyro.deterministic('rmse', jnp.sqrt((resid**2).sum() / len(resid)))
+        if target.lower() == 'bai':
+            bai_obs = y
+            dbh_end_obs = jnp.sqrt(4/jnp.pi*bai_obs +  dbh**2)
+            dg_obs = dbh_end_obs - dbh
+        
+        elif target.lower() == 'dg':
+            dg_obs = y
+            bai_obs = jnp.pi/4*((dbh+dg_obs)**2 - dbh**2)
+        
+        bai_resid = numpyro.deterministic('bai_resid', bai_pred - bai_obs)
+        bai_ss_res = ((bai_obs - bai_pred)**2).sum()
+        bai_ss_tot = ((bai_obs - bai_obs.mean())**2).sum()
+        bai_r2 = numpyro.deterministic('bai_r2', 1 - bai_ss_res/bai_ss_tot) 
+        bai_bias = numpyro.deterministic('bai_bias', bai_resid.mean())
+        bai_mae = numpyro.deterministic('bai_mae', jnp.abs(bai_resid).mean())
+        bai_rmse = numpyro.deterministic('bai_rmse', jnp.sqrt((bai_resid**2).sum() / num_trees))
+        dg_resid = numpyro.deterministic('dg_resid', dg_pred - dg_obs)
+        dg_ss_res = ((dg_obs - dg_pred)**2).sum()
+        dg_ss_tot = ((dg_obs - dg_obs.mean())**2).sum()
+        dg_r2 = numpyro.deterministic('dg_r2', 1 - dg_ss_res/dg_ss_tot)
+        dg_bias = numpyro.deterministic('dg_bias', dg_resid.mean())
+        dg_mae = numpyro.deterministic('dg_mae', jnp.abs(dg_resid).mean())
+        dg_rmse = numpyro.deterministic('dg_rmse', jnp.sqrt((dg_resid**2).sum() / num_trees))
         
         
 def potential_modified_model(X, num_steps, bark_b1, bark_b2,
                              num_variants, num_locations, num_plots, 
-                             y=None, pooling='unpooled'):
-    """A recursive model that predicts basal area increment for individual trees
-    adapted from the general form of Wykoff (1990), with annualization inspired
-    by Cao (2000, 2004), and mixed model approach illustrated by Weiskittel
-    et al., (2007). 
+                             y=None, target='bai', pooling='unpooled'):
+    """A recursive model that predicts diameter growth or basal area increment 
+    for individual trees adapted from the general form of Wykoff (1990), with 
+    annualization inspired by Cao (2000, 2004), and mixed effects approach 
+    illustrated by Weiskittel et al., (2007). 
     
     The Wykoff model employs a linear model to predict the log of the
     difference between squared inside-bark diameter from one timestep to the 
@@ -267,8 +287,6 @@ def potential_modified_model(X, num_steps, bark_b1, bark_b2,
           13. competition_standlevel_end
     num_steps : int
       number of steps (or cycles) of growth to simulate
-    y : scalar or list-like
-      observed outside-bark diameter growth
     bark_b1, bark_b2 : scalar
       coefficients used to convert diameter outside bark to diameter inside 
       bark, as DIB = b1*(DBH**b2)
@@ -278,6 +296,10 @@ def potential_modified_model(X, num_steps, bark_b1, bark_b2,
       number of distinct locations across dataset, modeled as a random effect
     num_plots : int
       number of distinct plots across dataset, modeled as a random effect
+    y : scalar or list-like
+      observed outside-bark diameter growth
+    target : str
+      type of target variable, may be 'bai' or 'dg'
     pooling : str
       degree of pooling for model covariates across variants/ecoregions, valid
       are 'unpooled', 'pooled', or 'partial'. 
@@ -381,16 +403,12 @@ def potential_modified_model(X, num_steps, bark_b1, bark_b2,
     adjust = (b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8)
     b0 = numpyro.deterministic('b0', b0z - adjust)
     
-    eloc_mu = numpyro.sample('eloc_mu', dist.Normal(0., 0.5))
-    eloc_sd = numpyro.sample('eloc_sd', dist.HalfNormal(1.0))
     with numpyro.plate('locations', num_locations):
-        eloc = numpyro.sample('eloc', dist.Normal(eloc_mu, eloc_sd)) # random effect of location
+        eloc = numpyro.sample('eloc', dist.Normal(0, 1.0)) # random effect of location
     
     if y is not None:
-        eplot_mu = numpyro.sample('eplot_mu', dist.Normal(0., 0.5))
-        eplot_sd = numpyro.sample('eplot_sd', dist.HalfNormal(1.0))
         with numpyro.plate('plots', num_plots):
-            eplot = numpyro.sample('eplot', dist.Normal(eplot_mu, eplot_sd)) # random effect of plot
+            eplot = numpyro.sample('eplot', dist.Normal(0, 1.0)) # random effect of plot
     else:
         eplot = 0 * plot
 
@@ -430,19 +448,42 @@ def potential_modified_model(X, num_steps, bark_b1, bark_b2,
         
     step_covars = (crown_ratio, comp_tree, comp_stand)
     dbh_end, growth = scan(step, dbh, step_covars, length=num_steps)
-    bai_pred = numpyro.deterministic('bai_pred', jnp.pi/4*(dbh_end**2 - dbh**2))
     
-    etree = numpyro.sample('etree', dist.Gamma(4.0, 0.1))
+    dg_pred = numpyro.deterministic('dg_pred', dbh_end - dbh)
+    bai_pred = numpyro.deterministic('bai_pred', jnp.pi/4*(dbh_end**2 - dbh**2))
 
     with numpyro.plate('plate_obs', size=num_trees):        
-        obs = numpyro.sample('obs', dist.Cauchy(bai_pred, etree), obs=y)
+        if target.lower() == 'bai':
+            etree_bai = numpyro.sample('etree_bai', dist.Gamma(4.0, 0.1))
+            obs = numpyro.sample('obs', dist.Cauchy(bai_pred, etree_bai), obs=y)
+        elif target.lower() == 'dg':
+            etree_dg = numpyro.sample('etree_dg', dist.InverseGamma(2.0, 0.25))
+            obs = numpyro.sample('obs', dist.Cauchy(dg_pred, etree_dg), obs=y)
     
     if y is not None:
-        err = numpyro.sample('err', dist.Cauchy(0, etree))
-        resid = numpyro.deterministic('resid', bai_pred + err - y)
-        bias = numpyro.deterministic('bias', resid.mean())
-        mae = numpyro.deterministic('mae', jnp.abs(resid).mean())
-        rmse = numpyro.deterministic('rmse', jnp.sqrt((resid**2).sum() / len(resid)))
+        if target.lower() == 'bai':
+            bai_obs = y
+            dbh_end_obs = jnp.sqrt(4/jnp.pi*bai_obs +  dbh**2)
+            dg_obs = dbh_end_obs - dbh
+        
+        elif target.lower() == 'dg':
+            dg_obs = y
+            bai_obs = jnp.pi/4*((dbh+dg_obs)**2 - dbh**2)
+        
+        bai_resid = numpyro.deterministic('bai_resid', bai_pred - bai_obs)
+        bai_ss_res = ((bai_obs - bai_pred)**2).sum()
+        bai_ss_tot = ((bai_obs - bai_obs.mean())**2).sum()
+        bai_r2 = numpyro.deterministic('bai_r2', 1 - bai_ss_res/bai_ss_tot) 
+        bai_bias = numpyro.deterministic('bai_bias', bai_resid.mean())
+        bai_mae = numpyro.deterministic('bai_mae', jnp.abs(bai_resid).mean())
+        bai_rmse = numpyro.deterministic('bai_rmse', jnp.sqrt((bai_resid**2).sum() / num_trees))
+        dg_resid = numpyro.deterministic('dg_resid', dg_pred - dg_obs)
+        dg_ss_res = ((dg_obs - dg_pred)**2).sum()
+        dg_ss_tot = ((dg_obs - dg_obs.mean())**2).sum()
+        dg_r2 = numpyro.deterministic('dg_r2', 1 - dg_ss_res/dg_ss_tot)
+        dg_bias = numpyro.deterministic('dg_bias', dg_resid.mean())
+        dg_mae = numpyro.deterministic('dg_mae', jnp.abs(dg_resid).mean())
+        dg_rmse = numpyro.deterministic('dg_rmse', jnp.sqrt((dg_resid**2).sum() / num_trees))
         
         
         
