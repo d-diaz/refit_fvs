@@ -5,12 +5,10 @@ build:
     - mamba env create --quiet --name refit_fvs --file environment.yml
     - source activate refit_fvs
   only:
-    refs:
-    - merge_requests
     changes:
-      environment.yml
-      Dockerfile
-      refit_fvs/*
+      - environment.yml
+      - Dockerfile
+      - refit_fvs/*
   allow_failure: false
 
 lint:
@@ -19,4 +17,3 @@ lint:
   script:
     - flake8 . --max-line-length=88 --ignore=F841,W503
   allow_failure: false
-s
