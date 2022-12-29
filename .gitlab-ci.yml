@@ -6,7 +6,7 @@ build:
     - source activate refit_fvs
     - conda install -c conda-forge coveralls flake8 black
     - cd refit_fvs && pip install -e . && cd ..
-  allow_failture: false
+  allow_failure: false
 
 lint:
   script:
