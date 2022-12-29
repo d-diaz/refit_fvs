@@ -3,7 +3,7 @@ image: continuumio/miniconda3:latest
 before_script:
   - apt-get update
   - wget -O Mambaforge.sh  "https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-$(uname)-$(uname -m).sh"
-  - bash Miniforge3.sh -b -p "${HOME}/conda"
+  - bash Mambaforge.sh -b -p "${HOME}/conda"
   - source "${HOME}/conda/etc/profile.d/mamba.sh"
   - conda activate
 
