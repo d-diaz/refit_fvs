@@ -75,7 +75,7 @@ class NegativeGamma(Distribution):
             self.rate
         )
         return (
-            (concentration-1) * jnp.log(value)
+            (concentration - 1) * jnp.log(value)
             - self.rate * value
             - normalize_term
         )
