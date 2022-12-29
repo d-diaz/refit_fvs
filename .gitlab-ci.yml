@@ -1,4 +1,11 @@
-image: mambaorg/micromamba:latest
+image: continuumio/miniconda3:latest
+
+before_script:
+  - apt-get update
+  - wget -O Mambaforge.sh  "https://github.com/conda-forge/miniforge/releases/latest/download/Mambaforge-$(uname)-$(uname -m).sh"
+  - bash Miniforge3.sh -b -p "${HOME}/conda"
+  - source "${HOME}/conda/etc/profile.d/mamba.sh"
+  - conda activate
 
 build:
   script:
@@ -9,7 +16,7 @@ build:
 
 lint:
   before_script:
-  - mamba install -c conda-forge flake8
+  - mamba install flake8
   script:
     - flake8 . --max-line-length=88 --ignore=F841,W503
   allow_failure: false
