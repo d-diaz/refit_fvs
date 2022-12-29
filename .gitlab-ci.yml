@@ -4,7 +4,7 @@ build:
   script:
     - mamba env create --quiet --name refit_fvs --file environment.yml
     - source activate refit_fvs
-    - cd refit_fvs && pip install -e . && cd ..
+    - pip install -e .
   allow_failure: false
 
 lint:
