@@ -5,6 +5,9 @@ build:
     - mamba env create --quiet --name refit_fvs --file environment.yml
     - source activate refit_fvs
     - pip install -e .
+  rules:
+    changes:
+      environment.yml
   allow_failure: false
 
 lint:
