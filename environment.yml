@@ -5,7 +5,7 @@ channels:
 
 dependencies:
   - arviz
-  # - earthengine-api
+  - earthengine-api
   - geopandas
   - ipywidgets
   - jinja2
