@@ -1,15 +1,15 @@
-image: continuumio/miniconda3:latest
+image: mambaorg/micromamba:latest
 
 build:
   script:
-    - conda env create --quiet --name refit_fvs --file environment.yml
+    - mamba env create --quiet --name refit_fvs --file environment.yml
     - source activate refit_fvs
     - cd refit_fvs && pip install -e . && cd ..
   allow_failure: false
 
 lint:
   before_script:
-  - conda install -c conda-forge flake8
+  - mamba install -c conda-forge flake8
   script:
     - flake8 . --max-line-length=88 --ignore=F841,W503
   allow_failure: false
