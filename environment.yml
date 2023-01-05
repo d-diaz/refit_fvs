@@ -16,6 +16,7 @@ dependencies:
   - pip
   - pip:
       - -e .  # install local refit_fvs package in editable mode
+      - soiltexture
   - psycopg2
   - pvlib-python
   - python
