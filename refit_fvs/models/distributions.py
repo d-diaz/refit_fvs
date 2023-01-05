@@ -3,8 +3,10 @@ from jax import random, lax
 from numpyro.distributions.util import (is_prng_key, promote_shapes,
                                         validate_sample)
 
-from numpyro.distributions import constraints, Normal
-from numpyro.distributions.distribution import Distribution
+from numpyro.distributions import constraints, Normal, Beta
+from numpyro.distributions.distribution import Distribution, TransformedDistribution
+from numpyro.distributions.transforms import AffineTransform
+
 from jax.scipy.special import gammaln, gammainc
 
 
@@ -75,7 +77,7 @@ class NegativeGamma(Distribution):
             self.rate
         )
         return (
-            (concentration - 1) * jnp.log(value)
+            (concentration-1) * jnp.log(value)
             - self.rate * value
             - normalize_term
         )
@@ -90,3 +92,47 @@ class NegativeGamma(Distribution):
 
     def cdf(self, x):
         return 1 - gammainc(-self.concentration, self.rate * -x)
+
+    
+class AffineBeta(TransformedDistribution):
+    arg_constraints = {
+        "concentration1": constraints.positive,
+        "concentration0": constraints.positive,
+        "loc": constraints.real,
+        "scale": constraints.positive,
+    }
+    reparametrized_params = ["concentration1", "concentration0"]
+    
+    def __init__(self, concentration1, concentration0, loc, scale, validate_args=None):
+        self.concentration1, self.concentration0, self.loc, self.scale = promote_shapes(
+            concentration1, concentration0, loc, scale
+        )
+        batch_shape = lax.broadcast_shapes(
+            jnp.shape(concentration1), jnp.shape(concentration0), jnp.shape(loc), jnp.shape(scale),
+        )
+        base_dist = Beta(concentration1, concentration0)
+        super(AffineBeta, self).__init__(
+            base_dist,
+            AffineTransform(loc=loc, scale=scale, domain=constraints.unit_interval),
+            validate_args=validate_args,
+        )
+    
+    @constraints.dependent_property
+    def support(self):
+        return constraints.interval(self.low, self.high)
+    
+    @property
+    def low(self):
+        return self.loc
+
+    @property
+    def high(self):
+        return self.loc + self.scale
+
+    @property
+    def mean(self):
+        return self.loc + self.scale * self.base_dist.mean
+
+    @property
+    def variance(self):
+        return self.scale**2 * self.base_dist.variance
