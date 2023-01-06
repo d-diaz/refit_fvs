@@ -1,13 +1,11 @@
+from jax import lax
 from jax import numpy as jnp
-from jax import random, lax
-from numpyro.distributions.util import (is_prng_key, promote_shapes,
-                                        validate_sample)
-
-from numpyro.distributions import constraints, Normal, Beta
+from jax import random
+from jax.scipy.special import gammainc, gammaln
+from numpyro.distributions import Beta, Normal, constraints
 from numpyro.distributions.distribution import Distribution, TransformedDistribution
 from numpyro.distributions.transforms import AffineTransform
-
-from jax.scipy.special import gammaln, gammainc
+from numpyro.distributions.util import is_prng_key, promote_shapes, validate_sample
 
 
 class NegativeHalfNormal(Distribution):
@@ -45,7 +43,7 @@ class NegativeHalfNormal(Distribution):
 
     @property
     def variance(self):
-        return (1 - 2 / jnp.pi) * self.scale ** 2
+        return (1 - 2 / jnp.pi) * self.scale**2
 
 
 class NegativeGamma(Distribution):
@@ -58,8 +56,7 @@ class NegativeGamma(Distribution):
 
     def __init__(self, concentration, rate=1.0, validate_args=None):
         self.concentration, self.rate = promote_shapes(concentration, rate)
-        batch_shape = lax.broadcast_shapes(jnp.shape(concentration),
-                                           jnp.shape(rate))
+        batch_shape = lax.broadcast_shapes(jnp.shape(concentration), jnp.shape(rate))
         super(NegativeGamma, self).__init__(
             batch_shape=batch_shape, validate_args=validate_args
         )
@@ -73,14 +70,8 @@ class NegativeGamma(Distribution):
     def log_prob(self, value):
         concentration = -self.concentration
         value = -value
-        normalize_term = gammaln(concentration) - concentration * jnp.log(
-            self.rate
-        )
-        return (
-            (concentration-1) * jnp.log(value)
-            - self.rate * value
-            - normalize_term
-        )
+        normalize_term = gammaln(concentration) - concentration * jnp.log(self.rate)
+        return (concentration - 1) * jnp.log(value) - self.rate * value - normalize_term
 
     @property
     def mean(self):
@@ -93,7 +84,7 @@ class NegativeGamma(Distribution):
     def cdf(self, x):
         return 1 - gammainc(-self.concentration, self.rate * -x)
 
-    
+
 class AffineBeta(TransformedDistribution):
     arg_constraints = {
         "concentration1": constraints.positive,
@@ -102,13 +93,16 @@ class AffineBeta(TransformedDistribution):
         "scale": constraints.positive,
     }
     reparametrized_params = ["concentration1", "concentration0"]
-    
+
     def __init__(self, concentration1, concentration0, loc, scale, validate_args=None):
         self.concentration1, self.concentration0, self.loc, self.scale = promote_shapes(
             concentration1, concentration0, loc, scale
         )
         batch_shape = lax.broadcast_shapes(
-            jnp.shape(concentration1), jnp.shape(concentration0), jnp.shape(loc), jnp.shape(scale),
+            jnp.shape(concentration1),
+            jnp.shape(concentration0),
+            jnp.shape(loc),
+            jnp.shape(scale),
         )
         base_dist = Beta(concentration1, concentration0)
         super(AffineBeta, self).__init__(
@@ -116,11 +110,11 @@ class AffineBeta(TransformedDistribution):
             AffineTransform(loc=loc, scale=scale, domain=constraints.unit_interval),
             validate_args=validate_args,
         )
-    
+
     @constraints.dependent_property
     def support(self):
         return constraints.interval(self.low, self.high)
-    
+
     @property
     def low(self):
         return self.loc
