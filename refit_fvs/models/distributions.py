@@ -3,9 +3,11 @@ from jax import numpy as jnp
 from jax import random
 from jax.scipy.special import gammainc, gammaln
 from numpyro.distributions import Beta, Normal, constraints
-from numpyro.distributions.distribution import Distribution, TransformedDistribution
+from numpyro.distributions.distribution import (Distribution,
+                                                TransformedDistribution)
 from numpyro.distributions.transforms import AffineTransform, ExpTransform
-from numpyro.distributions.util import is_prng_key, promote_shapes, validate_sample
+from numpyro.distributions.util import (is_prng_key, promote_shapes,
+                                        validate_sample)
 
 
 class NegativeLogNormal(TransformedDistribution):

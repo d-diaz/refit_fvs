@@ -2,12 +2,8 @@ import numpyro
 import numpyro.distributions as dist
 from jax import numpy as jnp
 from numpyro.contrib.control_flow import scan
-
-from refit_fvs.models.distributions import (
-    AffineBeta,
-    NegativeHalfNormal,
-    NegativeLogNormal,
-)
+from refit_fvs.models.distributions import (AffineBeta, NegativeHalfNormal,
+                                            NegativeLogNormal)
 
 
 def wykoff_model(
@@ -879,7 +875,6 @@ def vslite_model(
         )  # comp_tree  # BAL / ln(dbh+1)
         b8z = numpyro.sample("b8z", NegativeLogNormal(0.0, 2.0))  # comp_stand  # ln(BA)
 
-        bclim = numpyro.sample("bclim", dist.LogNormal(0.0, 0.5))
         m1 = numpyro.sample("m1", AffineBeta(1.5, 2.8, 0.0, 0.1))
         m2 = numpyro.sample("m2", AffineBeta(1.5, 2.5, 0.1, 0.7))
         t1 = numpyro.sample("t1", AffineBeta(9.0, 5.0, 0.0, 9.0))
@@ -901,11 +896,10 @@ def vslite_model(
                 "b8z", NegativeLogNormal(0.0, 2.0)
             )  # comp_stand  # ln(BA)
 
-            bclim = numpyro.sample("bclim", dist.LogNormal(0.0, 0.5))
             m1 = numpyro.sample("m1", AffineBeta(1.5, 2.8, 0.0, 0.1))
             m2 = numpyro.sample("m2", AffineBeta(1.5, 2.5, 0.1, 0.7))
-            t1 = numpyro.sample("t1", AffineBeta(9.0, 5.0, 0.0, 7.0))
-            t2 = numpyro.sample("t2", AffineBeta(3.5, 3.5, 7.0, 17.0))
+            t1 = numpyro.sample("t1", AffineBeta(9.0, 5.0, 0.0, 9.0))
+            t2 = numpyro.sample("t2", AffineBeta(3.5, 3.5, 10.0, 14.0))
 
     elif pooling == "partial":
         b0z_mu = numpyro.sample("b0z_mu", dist.Normal(0, 1.0))
@@ -928,8 +922,6 @@ def vslite_model(
         b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(1.0))
         b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(1.0))
 
-        bclim_mu = numpyro.sample("bclim_mu", dist.Normal(0, 1.0))
-        bclim_sd = numpyro.sample("bclim_sd", dist.HalfNormal(1.0))
         m1_conc1 = numpyro.sample("m1_conc1", dist.Gamma(100, 67))
         m1_conc2 = numpyro.sample("m1_conc2", dist.Gamma(350, 125))
         m2_conc1 = numpyro.sample("m2_conc1", dist.Gamma(100, 67))
@@ -958,9 +950,8 @@ def vslite_model(
                 "b8z", NegativeLogNormal(b8z_mu, b8z_sd)
             )  # comp_stand  # ln(BA)
 
-            bclim = numpyro.sample("bclim", dist.LogNormal(bclim_mu, bclim_sd))
-            m1 = numpyro.sample("m1", AffineBeta(m1_conc1, m1_conc2, 0.0, 0.2))
-            m2 = numpyro.sample("m2", AffineBeta(m2_conc1, m2_conc2, 0.2, 0.7))
+            m1 = numpyro.sample("m1", AffineBeta(m1_conc1, m1_conc2, 0.0, 0.1))
+            m2 = numpyro.sample("m2", AffineBeta(m2_conc1, m2_conc2, 0.1, 0.7))
             t1 = numpyro.sample("t1", AffineBeta(t1_conc1, t1_conc2, 0.0, 7.0))
             t2 = numpyro.sample("t2", AffineBeta(t2_conc1, t2_conc2, 7.0, 17.0))
     else:
@@ -1009,13 +1000,13 @@ def vslite_model(
             size = b1 * jnp.log(dbh) + b2 * dbh**2
             site = b3 * jnp.log(site_index) + b4 * slope  # + b5 * elev # drop elevation
             comp = b6 * crown_ratio + b7 * comp_tree + b8 * comp_stand
-
             fm = (moisture - m1) / (m2 - m1)
             fm = 1 / (1 + jnp.exp(-6 * (fm - 0.5)))
             ft = (temp - t1) / (t2 - t1)
             ft = 1 / (1 + jnp.exp(-6 * (ft - 0.5)))
+
             clim = jnp.log(
-                bclim * (solar * jnp.minimum(ft, fm)).sum(axis=0) / solar.sum(axis=0)
+                (solar * jnp.minimum(ft, fm)).sum(axis=0) / solar.sum(axis=0)
             )
 
             ln_dds = b0 + size + site + comp + clim + eloc[loc] + eplot[plot]
@@ -1038,9 +1029,7 @@ def vslite_model(
             ft = (temp - t1[variant]) / (t2[variant] - t1[variant])
             ft = 1 / (1 + jnp.exp(-6 * (ft - 0.5)))
             clim = jnp.log(
-                bclim[variant]
-                * (solar * jnp.minimum(ft, fm)).sum(axis=0)
-                / solar.sum(axis=0)
+                (solar * jnp.minimum(ft, fm)).sum(axis=0) / solar.sum(axis=0)
             )
 
             ln_dds = b0[variant] + size + site + comp + clim + eloc[loc] + eplot[plot]
@@ -1107,6 +1096,8 @@ def threepg_model(
     y=None,
     target="dg",
     pooling="unpooled",
+    loc_random=False,
+    plot_random=False,
 ):
     """A recursive model that predicts diameter growth or basal area increment
     for individual trees adapted from the general form of Wykoff (1990), with
@@ -1283,14 +1274,23 @@ def threepg_model(
     adjust = b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8
     b0 = numpyro.deterministic("b0", b0z - adjust)
 
-    with numpyro.plate("locations", num_locations):
-        eloc = numpyro.sample("eloc", dist.Normal(0, 1.0))  # random effect of location
+    if loc_random:
+        with numpyro.plate("locations", num_locations - 1):
+            eloc_ = numpyro.sample(
+                "eloc", dist.Normal(0, 0.1)
+            )  # random location effect
+        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
+        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+    else:
+        eloc = 0 * loc
 
-    if y is not None:
-        with numpyro.plate("plots", num_plots):
-            eplot = numpyro.sample(
-                "eplot", dist.Normal(0, 1.0)
+    if plot_random:
+        with numpyro.plate("plots", num_plots - 1):
+            eplot_ = numpyro.sample(
+                "eplot", dist.Normal(0, 0.1)
             )  # random effect of plot
+        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
+        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
     else:
         eplot = 0 * plot
 
