@@ -26,8 +26,6 @@ Project Organization
     │   ├── processed      <- Data sets ready for modeling.
     │   └── raw            <- Extracted and/or unprocessed data ready for processing.
     │
-    ├── docs               <- Read The Docs documentation.
-    │
     ├── models             <- Outputs from model calibration and tuning.
     │
     ├── notebooks          <- Jupyter notebooks for data processing, modeling, and interpretation.
@@ -37,8 +35,8 @@ Project Organization
     ├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
     │   └── figures        <- Generated graphics and figures to be used in reporting
     │
-    ├── environment.yml   <- The requirements for reproducing the analysis environment,
-    │                         installable as a conda environment.
+    ├── environment.yml    <- Reproducible computing environment to install with conda or mamba.
+    │
     ├── setup.py           <- makes project pip installable (pip install -e .) so src can be imported
     │                     
     ├── refit_fvs          <- Source code for use in this project.
@@ -49,9 +47,9 @@ Project Organization
     │   │
     │   ├── visualization  <- Scripts to visualize and interpret data and models.
     │   │
-    │   └──  tests         <- Scripts to test source code.
+    │   └── tests          <- Scripts to test source code.
     │
-    └── .travis.yml        <- configuration file for continuous integration with Travis CI.
+    └── .gitlab-ci.yml     <- configuration file for continuous integration with GitLab.
 
 
 --------
