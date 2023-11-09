@@ -1,29 +1,204 @@
 import numpyro
 import numpyro.distributions as dist
 from jax import numpy as jnp
+from jax.random import PRNGKey
 from numpyro.contrib.control_flow import scan
 from refit_fvs.models.distributions import (AffineBeta, NegativeHalfNormal,
                                             NegativeLogNormal)
+from jax import random
 
 
-def wykoff_model(
-    data,
-    num_cycles,
+def wykoff_simulator(
+    bark_b0,
     bark_b1,
     bark_b2,
+    beta_mean,
+    beta_sd,
+    etree_mean,
+    etree_sd,
+    data,
+    dbh_err_func,
+    rad_err_func,
+    tree_comp,
+    stand_comp,
+    loc_sd=None,
+    plot_sd=None
+):
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    (
+        var_idx,
+        loc_idx,
+        plot_idx,
+        site_index,
+        slope,
+        asp,
+        elev,
+        dbh,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
+    ) = data
+    
+    num_trees = dbh.size
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
+    site_index = jnp.asarray(site_index).reshape(-1)
+    slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
+    elev = jnp.asarray(elev).reshape(-1)
+    
+    dbh = jnp.asarray(dbh).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if tree_comp == 'bal':
+        X_tree = bal[:,0]
+    elif tree_comp == 'relht':
+        X_tree = relht[:,0]
+    else:  # tree_comp == 'ballndbh':
+        X_tree = bal[:,0] / jnp.log(dbh + 1.0)
+    
+    if stand_comp == 'ba':
+        X_stand = bapa[:,0]
+    elif stand_comp == 'lnba':
+        X_stand = jnp.log(bapa[:,0])
+    else:  # stand_comp == 'ccf':
+        X_stand = ccf[:,0]
+    
+    X = jnp.array(
+        [
+            jnp.log(dbh),
+            dbh**2,
+            jnp.log(site_index),
+            slope,
+            slope**2,
+            slope * jnp.sin(asp),
+            slope * jnp.cos(asp),
+            elev,
+            elev**2,
+            crown_ratio[:,0],
+            crown_ratio[:,0]**2,
+            X_tree,
+            X_stand,
+        ]
+    )
+    X_mu = X.mean(axis=1)
+    X_sd = X.std(axis=1)
+    
+    bz = dist.Normal(beta_mean, beta_sd).sample(PRNGKey(0))
+    b0z, b1z, b2z, b3z, b4z, b5z, b6z, b7z, b8z, b9z, b10z, b11z, b12z, b13z = bz
+    etree_conc, etree_rate = etree_mean**2/etree_sd**2, etree_mean/etree_sd**2
+    etree = dist.Gamma(etree_conc, etree_rate).sample(PRNGKey(0)) # periodic (5-yr error)
+    
+    b_ = bz[1:] / X_sd
+    b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13 = b_
+    
+    adjust = (
+        b1*X_mu[0] + b2*X_mu[1] + b3*X_mu[2] + b4*X_mu[3]
+        + b5*X_mu[4] + b6*X_mu[5] + b7*X_mu[6] + b8*X_mu[7]
+        + b9*X_mu[8] + b10*X_mu[9] + b11*X_mu[10] 
+        + b12*X_mu[11] + b13*X_mu[12]
+    )
+    b0 = b0z - adjust
+    
+    num_locations = location.max() + 1
+    if loc_sd is not None:    
+        eloc = dist.Normal(0, loc_sd).sample(PRNGKey(0), sample_shape=(num_locations,))
+    else:
+        eloc = jnp.zeros(num_locations)
+    num_plots = plot.max() + 1
+    if plot_sd is not None:
+        eplot = dist.Normal(0, plot_sd).sample(PRNGKey(0), sample_shape=(num_plots,))
+    else:
+        eplot = jnp.zeros(num_plots)
+                                                
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        size = b1 * jnp.log(dbh0) + b2 * dbh0**2
+        site = (
+            b3 * jnp.log(site_index) + b4 * slope + b5 * slope**2 
+            + b6 * slope*jnp.sin(asp) + b7 * slope*jnp.cos(asp) 
+            + b8 * elev + b9 * elev**2
+        )
+        comp = b10 * cr_ + b11 * cr_**2 + b12 * tree_var + b13 * stand_var
+
+        ln_dds_ = b0 + size + site + comp + eloc[location] + eplot[plot]
+        ln_dds = dist.Normal(ln_dds_, etree).sample(PRNGKey(0))
+        
+        dds = jnp.exp(ln_dds)
+        dib0 = bark_b0 + bark_b1 * dbh0**bark_b2
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0) / bark_b1) ** (1 / bark_b2)
+
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records    
+    dbh_start = dist.Laplace(dbh, dbh_err_func(dbh)).sample(PRNGKey(0))
+    num_cycles=2
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
+    
+    meas_dbh_next = dist.Laplace(real_dbh[:, 2], dbh_err_func(real_dbh[:, 2])).sample(PRNGKey(0))
+    meas_5yr = dist.Normal(
+        radial_growth[1,:], 
+        rad_err_func(radial_growth[1,:])
+    ).sample(PRNGKey(0))
+    meas_10yr = dist.Normal(
+        radial_growth[:2,:].sum(axis=0), 
+        rad_err_func(radial_growth[:2,:].sum(axis=0))
+    ).sample(PRNGKey(0))
+    
+    return dbh_end, meas_5yr, meas_10yr                                     
+                                     
+    
+def wykoff_forward(
+    bark_b0,
+    bark_b1,
+    bark_b2,
+    tree_comp,
+    stand_comp,
+    pooling,
+    loc_random,
+    plot_random,
     num_variants,
     num_locations,
     num_plots,
-    y=None,
-    target="dg",
-    pooling="unpooled",
-    loc_random=False,
-    plot_random=False,
+    num_cycles,
+    data,
+    dbh_next=None,
+    exist_5yr=None,
+    obs_5yr=None,
+    exist_10yr=None,
+    obs_10yr=None,
 ):
-    """A recursive model that predicts diameter growth or basal area increment
-    for individual trees following the general form of Wykoff (1990), with
-    annualization inspired by Cao (2000, 2004), and mixed effects approach
-    illustrated by Weiskittel et al., (2007).
+    """A recursive model that predicts diameter growth time series 
+    for individual trees following the general form of Wykoff (1990) 
+    utilizing a five-year timestep along with an optional mixed effects approach
+    for localities and plots following Weiskittel et al., (2007).
 
     The Wykoff model employs a linear model to predict the log of the
     difference between squared inside-bark diameter from one timestep to the
@@ -32,76 +207,1064 @@ def wykoff_model(
     location, and for each plot. The model can be fit using an arbitrary number
     of time steps, and with three alternatives to incorporate hierarchical model
     structure across ecoregions: fully pooled, fully unpooled, and partially
-    pooled. The likelihood for the model is calculated from the periodic
-    outside-bark diameter growth using a Cauchy distribution to as a form of
-    robust regression to help reduce the influence of extreme growth
-    observations (both negative and positive) compared to a Normal likelihood.
+    pooled. 
+    
+    Data likelihoods for the model can accomodate three different types of
+    observations: outside bark diameter measurements (DBH), and radial 
+    growth increments measured from years 0-10 or years 5-10. 
+    
+    Measurement error for both DBH and radial increment are incorporated, 
+    resulting in a Bayesian state space model form. 
 
     Parameters
     ----------
     data : list-like
       predictor variables, expected in the following order:
-          1. variant_index
-          2. location_index
-          3. plot_index
-          4. site_index
-          5. slope, in percent, where 100% slope = 1.0
-          6. elevation
-          7. diameter at breast height
-          8. crown_ratio_start, as a proportion, where 100% = 1.0
-          9. crown_ratio_end, as a proportion, where 100% = 1.0
-          10. competition_treelevel_start
-          11. competition_treelevel_end
-          12. competition_standlevel_start
-          13. competition_standlevel_end
+      ... TO DO ...
+    tree_comp : str
+      tree_level competion variable to use, options are:
+      'bal', 'relht', or 'ballndbh'.
+    stand_comp : str
+      stand_level competition variable to use, options are:
+      'ba', 'lnba', or 'ccf'
     num_cycles : int
-      number of steps (or cycles) of growth to simulate
-    bark_b1, bark_b2 : scalar
+      number of five-year steps (or cycles) of growth to simulate
+    bark_b0, bark_b1, bark_b2 : scalar
       coefficients used to convert diameter outside bark to diameter inside
-      bark, as DIB = b1*(DBH**b2)
-    num_variants : int
-      number of distinct variants or ecoregions across dataset
-    num_locations : int
-      number of distinct locations across dataset, modeled as a random effect
-    num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
-    y : scalar or list-like
-      observed values for target (basal area increment or diameter growth)
-    target : str
-      type of target variable, may be 'bai' or 'dg'
-    pooling : str
-      degree of pooling for model covariates across variants/ecoregions, valid
-      are 'unpooled', 'pooled', or 'partial'.
+      bark, as DIB = b0 + b1*(DBH**b2)
+    obs_dbh : scalar or list-like,
+        observed DBH measurements at 10 years since first measurement
+    exist_5yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 5-yr radial increment 
+        recorded
+    obs_5yr : scalar or list-like with shape (num_trees,)
+        observed five-year radial increments
+    exist_10yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 10-yr radial increment 
+        recorded
+    obs_10yr : scalar or list-like with shape (num_trees,)
+        observed ten-year radial increments
     """
+    assert pooling in ['pooled', 'unpooled', 'partial']
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    
     (
-        variant,
-        loc,
-        plot,
+        var_idx,
+        loc_idx,
+        plot_idx,
         site_index,
         slope,
+        asp,
         elev,
         dbh,
-        cr_start,
-        cr_end,
-        comp_tree_start,
-        comp_tree_end,
-        comp_stand_start,
-        comp_stand_end,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
     ) = data
 
-    dbh = jnp.asarray(dbh).reshape(-1)
-    y = jnp.asarray(y).reshape(-1)
     num_trees = dbh.size
-    variant = jnp.asarray(variant).reshape(-1)
-    loc = jnp.asarray(loc).reshape(-1)
-    plot = jnp.asarray(plot).reshape(-1)
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
     site_index = jnp.asarray(site_index).reshape(-1)
     slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
     elev = jnp.asarray(elev).reshape(-1)
-    crown_ratio = jnp.linspace(cr_start, cr_end, num_cycles)
-    comp_tree = jnp.linspace(comp_tree_start, comp_tree_end, num_cycles)
-    comp_stand = jnp.linspace(comp_stand_start, comp_stand_end, num_cycles)
+    
+    dbh = jnp.asarray(dbh).reshape(-1)
+    dbh_next = jnp.asarray(dbh_next).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if pooling == 'pooled':
+        b0 = numpyro.sample("b0", dist.Normal(2.8, 1.))
+        b1 = numpyro.sample("b1", dist.Normal(0., 1.))  # ln(dbh)
+        b2 = numpyro.sample("b2", dist.Normal(0., 1.))  # dbh**2
+        b3 = numpyro.sample("b3", dist.Normal(0., 1.))  # ln(site_index)
+        b4 = numpyro.sample("b4", dist.Normal(0., 1.))  # slope
+        b5 = numpyro.sample("b5", dist.Normal(0., 1.))  # slope**2
+        b6 = numpyro.sample("b6", dist.Normal(0., 1.))  # slsinasp
+        b7 = numpyro.sample("b7", dist.Normal(0., 1.))  # slcosasp
+        b8 = numpyro.sample("b8", dist.Normal(0., 1.))  # elev
+        b9 = numpyro.sample("b9", dist.Normal(0., 1.))  # elev**2
+        b10 = numpyro.sample("b10", dist.Normal(0., 1.))  # crown_ratio
+        b11 = numpyro.sample("b11", dist.Normal(0., 1.))  # crown_ratio**2
+        b12 = numpyro.sample("b12", dist.Normal(0., 1.))  # tree_comp
+        b13 = numpyro.sample("b13", dist.Normal(0., 1.))  # stand_comp
+        etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    elif pooling == 'unpooled':
+        with numpyro.plate('variants', num_variants):
+            b0 = numpyro.sample("b0", dist.Normal(2.8, 1.))
+            b1 = numpyro.sample("b1", dist.Normal(0., 1.))  # ln(dbh)
+            b2 = numpyro.sample("b2", dist.Normal(0., 1.))  # dbh**2
+            b3 = numpyro.sample("b3", dist.Normal(0., 1.))  # ln(site_index)
+            b4 = numpyro.sample("b4", dist.Normal(0., 1.))  # slope
+            b5 = numpyro.sample("b5", dist.Normal(0., 1.))  # slope**2
+            b6 = numpyro.sample("b6", dist.Normal(0., 1.))  # slsinasp
+            b7 = numpyro.sample("b7", dist.Normal(0., 1.))  # slcosasp
+            b8 = numpyro.sample("b8", dist.Normal(0., 1.))  # elev
+            b9 = numpyro.sample("b9", dist.Normal(0., 1.))  # elev**2
+            b10 = numpyro.sample("b10", dist.Normal(0., 1.))  # crown_ratio
+            b11 = numpyro.sample("b11", dist.Normal(0., 1.))  # crown_ratio**2
+            b12 = numpyro.sample("b12", dist.Normal(0., 1.))  # tree_comp
+            b13 = numpyro.sample("b13", dist.Normal(0., 1.))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    else:  # pooling == 'partial'
+        b0_mu = numpyro.sample("b0_mu", dist.Normal(2.5, 0.1))
+        b1_mu = numpyro.sample("b1_mu", dist.Normal(0.7, 0.1))  # ln(dbh) 
+        b2_mu = numpyro.sample("b2_mu", dist.Normal(-0.2, 0.1))  # dbh**2
+        b3_mu = numpyro.sample("b3_mu", dist.Normal(0.25, 0.1))  # ln(site_index)
+        b4_mu = numpyro.sample("b4_mu", dist.Normal(0., 0.1))  # slope
+        b5_mu = numpyro.sample("b5_mu", dist.Normal(0., 0.11))  # slope**2
+        b6_mu = numpyro.sample("b6_mu", dist.Normal(0., 0.05))  # slsinasp
+        b7_mu = numpyro.sample("b7_mu", dist.Normal(0., 0.05))  # slcosasp
+        b8_mu = numpyro.sample("b8_mu", dist.Normal(-0.3, 0.1))  # elev
+        b9_mu = numpyro.sample("b9_mu", dist.Normal(0.15, 0.1))  # elev**2
+        b10_mu = numpyro.sample("b10_mu", dist.Normal(0.8, 0.1))  # crown_ratio
+        b11_mu = numpyro.sample("b11_mu", dist.Normal(-0.4, 0.1))  # crown_ratio**2
+        b12_mu = numpyro.sample("b12_mu", dist.Normal(0., 0.25))  # tree_comp
+        b13_mu = numpyro.sample("b13_mu", dist.Normal(0., 0.25))  # stand_comp
+        b0_sd = numpyro.sample("b0_sd", dist.HalfNormal(1.0))
+        b1_sd = numpyro.sample("b1_sd", dist.HalfNormal(0.1))
+        b2_sd = numpyro.sample("b2_sd", dist.HalfNormal(0.1))
+        b3_sd = numpyro.sample("b3_sd", dist.HalfNormal(0.1))
+        b4_sd = numpyro.sample("b4_sd", dist.HalfNormal(0.1))
+        b5_sd = numpyro.sample("b5_sd", dist.HalfNormal(0.1))
+        b6_sd = numpyro.sample("b6_sd", dist.HalfNormal(0.1))
+        b7_sd = numpyro.sample("b7_sd", dist.HalfNormal(0.1))
+        b8_sd = numpyro.sample("b8_sd", dist.HalfNormal(0.1))
+        b9_sd = numpyro.sample("b9_sd", dist.HalfNormal(0.1))
+        b10_sd = numpyro.sample("b10_sd", dist.HalfNormal(0.1))
+        b11_sd = numpyro.sample("b11_sd", dist.HalfNormal(0.1))
+        b12_sd = numpyro.sample("b12_sd", dist.HalfNormal(0.1))
+        b13_sd = numpyro.sample("b13_sd", dist.HalfNormal(0.1))
 
+        with numpyro.plate("variants", num_variants):
+            b0 = numpyro.sample("b0", dist.Normal(b0_mu, b0_sd))
+            b1 = numpyro.sample("b1", dist.Normal(b1_mu, b1_sd))  # ln(dbh)
+            b2 = numpyro.sample("b2", dist.Normal(b2_mu, b2_sd))  # dbh**2
+            b3 = numpyro.sample("b3", dist.Normal(b3_mu, b3_sd))  # ln(site_index)
+            b4 = numpyro.sample("b4", dist.Normal(b4_mu, b4_sd))  # slope
+            b5 = numpyro.sample("b5", dist.Normal(b5_mu, b5_sd))  # slope**2
+            b6 = numpyro.sample("b6", dist.Normal(b6_mu, b6_sd))  # slsinasp
+            b7 = numpyro.sample("b7", dist.Normal(b7_mu, b7_sd))  # slcosasp
+            b8 = numpyro.sample("b8", dist.Normal(b8_mu, b8_sd))  # elev
+            b9 = numpyro.sample("b9", dist.Normal(b9_mu, b9_sd))  # elev**2
+            b10 = numpyro.sample("b10", dist.Normal(b10_mu, b10_sd))  # crown_ratio
+            b11 = numpyro.sample("b11", dist.Normal(b11_mu, b11_sd))  # crown_ratio**2
+            b12 = numpyro.sample("b12", dist.Normal(b12_mu, b12_sd))  # tree_comp
+            b13 = numpyro.sample("b13", dist.Normal(b13_mu, b13_sd))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    if loc_random:
+        with numpyro.plate("locations", num_locations - 1):
+            eloc_ = numpyro.sample(
+                "eloc_", dist.Normal(0, 0.1)
+            )  # random location effect
+        eloc_last = -eloc_.sum()
+        eloc = numpyro.deterministic(
+            "eloc",
+            jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        )
+    else:
+        eloc = 0 * location
+
+    if plot_random:
+        with numpyro.plate("plots", num_plots - 1):
+            eplot_ = numpyro.sample(
+                "eplot_", dist.Normal(0, 0.1)
+            )  # random effect of plot
+        eplot_last = -eplot_.sum()
+        eplot = numpyro.deterministic(
+            "eplot", 
+            jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        )
+    else:
+        eplot = 0 * plot   
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        if pooling == 'pooled':
+            size = b1 * jnp.log(dbh0) + b2 * dbh0**2
+            site = (
+                b3 * jnp.log(site_index) + b4 * slope + b5 * slope**2 
+                + b6 * slope*jnp.sin(asp) + b7 * slope*jnp.cos(asp) 
+                + b8 * elev + b9 * elev**2
+            )
+            comp = b10 * cr_ + b11 * cr_**2 + b12 * tree_var + b13 * stand_var
+
+            ln_dds_ = b0 + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree))
+        
+        else:
+            size = b1[variant] * jnp.log(dbh0) + b2[variant] * dbh0**2
+            site = (
+                b3[variant] * jnp.log(site_index) + b4[variant] * slope + b5[variant] * slope**2 
+                + b6[variant] * slope*jnp.sin(asp) + b7[variant] * slope*jnp.cos(asp) 
+                + b8[variant] * elev + b9[variant] * elev**2
+            )
+            comp = b10[variant] * cr_ + b11[variant] * cr_**2 + b12[variant] * tree_var + b13[variant] * stand_var
+
+            ln_dds_ = b0[variant] + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[variant]))
+        
+        dds = jnp.exp(ln_dds)
+        dib0 = bark_b0 + bark_b1 * dbh0**bark_b2
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0) / bark_b1) ** (1 / bark_b2)
+
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records
+    # assuming FIA meets measurement quality objectives
+    # dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, dbh/20.*0.1/1.65)) 
+    
+    # best estimate of DBH meas error in PNW from Melson et al. (2002)
+    # Melson estimate is about 3.75 times larger than FIA MQO
+    dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, 0.01*dbh))
+    
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = numpyro.deterministic(
+        'real_dbh',
+        jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
+    )
+    
+    meas_dbh_next = numpyro.sample(
+        'meas_dbh_next', 
+        # assuming FIA meets measurement quality objectives
+        # dist.Normal(real_dbh[:, 2], real_dbh[:, 2]/20.*0.1/1.65), 
+        # best estimate of DBH meas error in PNW from Melson et al. (2002)
+        # Melson estimate is about 3.75 times larger than FIA MQO
+        dist.Normal(real_dbh[:, 2], 0.01*real_dbh[:, 2]), 
+        obs=dbh_next
+        # to convert into annualized timestep where observations may or 
+        # may not be available in each year, use something like this...
+        # dist.Normal(
+        #     dbh_series[year_obs, tree_obs], 
+        #     dbh_series[year_obs, tree_obs]*.01
+        # ),
+        # obs=dbh_obs[tree_obs, year_obs]
+    )
+    
+    meas_5yr = numpyro.sample(
+        'meas_5yr', 
+        dist.Normal(
+            radial_growth[1, exist_5yr], 
+            radial_growth[1, exist_5yr]/20./1.65
+        ),
+        obs=obs_5yr[exist_5yr]
+    )
+    
+    meas_10yr = numpyro.sample(
+        'meas_10yr', 
+        dist.Normal(
+            radial_growth[:2, exist_10yr].sum(axis=0), 
+            radial_growth[:2, exist_10yr].sum(axis=0)/20./1.65
+        ),
+        obs=obs_10yr[exist_10yr]
+    )
+    
+    
+def simpler_wykoff_forward(
+    bark_b0,
+    bark_b1,
+    bark_b2,
+    tree_comp,
+    stand_comp,
+    pooling,
+    loc_random,
+    plot_random,
+    num_variants,
+    num_locations,
+    num_plots,
+    num_cycles,
+    data,
+    dbh_next=None,
+    exist_5yr=None,
+    obs_5yr=None,
+    exist_10yr=None,
+    obs_10yr=None,
+):
+    """A recursive model that predicts diameter growth time series 
+    for individual trees following the general form of Wykoff (1990) 
+    utilizing a five-year timestep along with an optional mixed effects approach
+    for localities and plots following Weiskittel et al., (2007).
+
+    The Wykoff model employs a linear model to predict the log of the
+    difference between squared inside-bark diameter from one timestep to the
+    next. A mixed effects model form is used, with fixed effect for tree size,
+    site variables, and competition variables, and random effects for each
+    location, and for each plot. The model can be fit using an arbitrary number
+    of time steps, and with three alternatives to incorporate hierarchical model
+    structure across ecoregions: fully pooled, fully unpooled, and partially
+    pooled. 
+    
+    Data likelihoods for the model can accomodate three different types of
+    observations: outside bark diameter measurements (DBH), and radial 
+    growth increments measured from years 0-10 or years 5-10. 
+    
+    Measurement error for both DBH and radial increment are incorporated, 
+    resulting in a Bayesian state space model form. 
+
+    Parameters
+    ----------
+    data : list-like
+      predictor variables, expected in the following order:
+      ... TO DO ...
+    tree_comp : str
+      tree_level competion variable to use, options are:
+      'bal', 'relht', or 'ballndbh'.
+    stand_comp : str
+      stand_level competition variable to use, options are:
+      'ba', 'lnba', or 'ccf'
+    num_cycles : int
+      number of five-year steps (or cycles) of growth to simulate
+    bark_b0, bark_b1, bark_b2 : scalar
+      coefficients used to convert diameter outside bark to diameter inside
+      bark, as DIB = b0 + b1*(DBH**b2)
+    obs_dbh : scalar or list-like,
+        observed DBH measurements at 10 years since first measurement
+    exist_5yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 5-yr radial increment 
+        recorded
+    obs_5yr : scalar or list-like with shape (num_trees,)
+        observed five-year radial increments
+    exist_10yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 10-yr radial increment 
+        recorded
+    obs_10yr : scalar or list-like with shape (num_trees,)
+        observed ten-year radial increments
+    """
+    assert pooling in ['pooled', 'unpooled', 'partial']
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    
+    (
+        var_idx,
+        loc_idx,
+        plot_idx,
+        site_index,
+        slope,
+        asp,
+        elev,
+        dbh,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
+    ) = data
+
+    num_trees = dbh.size
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
+    site_index = jnp.asarray(site_index).reshape(-1)
+    slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
+    elev = jnp.asarray(elev).reshape(-1)
+    dbh = jnp.asarray(dbh).reshape(-1)
+    dbh_next = jnp.asarray(dbh_next).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if pooling == 'pooled':
+        b0 = numpyro.sample("b0", dist.Normal(2.5, 1.))
+        b1 = numpyro.sample("b1", dist.Normal(0., 1.))  # ln(dbh)
+        b2 = numpyro.sample("b2", dist.Normal(0., 1.))  # dbh**2
+        b3 = numpyro.sample("b3", dist.Normal(0., 1.))  # ln(site_index)
+        b4 = numpyro.sample("b4", dist.Normal(0., 1.))  # slope
+        b5 = numpyro.sample("b5", dist.Normal(0., 1.))  # elev
+        b6 = numpyro.sample("b6", dist.Normal(0., 1.))  # crown_ratio
+        b7 = numpyro.sample("b7", dist.Normal(0., 1.))  # tree_comp
+        b8 = numpyro.sample("b8", dist.Normal(0., 1.))  # stand_comp
+        etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    elif pooling == 'unpooled':
+        with numpyro.plate('variants', num_variants):
+            b0 = numpyro.sample("b0", dist.Normal(2.5, 1.))
+            b1 = numpyro.sample("b1", dist.Normal(0., 1.))  # ln(dbh)
+            b2 = numpyro.sample("b2", dist.Normal(0., 1.))  # dbh**2
+            b3 = numpyro.sample("b3", dist.Normal(0., 1.))  # ln(site_index)
+            b4 = numpyro.sample("b4", dist.Normal(0., 1.))  # slope
+            b5 = numpyro.sample("b5", dist.Normal(0., 1.))  # elev
+            b6 = numpyro.sample("b6", dist.Normal(0., 1.))  # crown_ratio
+            b7 = numpyro.sample("b7", dist.Normal(0., 1.))  # tree_comp
+            b8 = numpyro.sample("b8", dist.Normal(0., 1.))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    else:  # pooling == 'partial'
+        b0_mu = numpyro.sample("b0_mu", dist.Normal(2.5, 0.1))
+        b1_mu = numpyro.sample("b1_mu", dist.Normal(0., 1.))  # ln(dbh) 
+        b2_mu = numpyro.sample("b2_mu", dist.Normal(0., 1.))  # dbh**2
+        b3_mu = numpyro.sample("b3_mu", dist.Normal(0., 1.))  # ln(site_index)
+        b4_mu = numpyro.sample("b4_mu", dist.Normal(0., 1.))  # slope
+        b5_mu = numpyro.sample("b5_mu", dist.Normal(0., 1.))  # elev
+        b6_mu = numpyro.sample("b6_mu", dist.Normal(0., 1.))  # crown_ratio
+        b7_mu = numpyro.sample("b7_mu", dist.Normal(0., 1.))  # tree_comp
+        b8_mu = numpyro.sample("b8_mu", dist.Normal(0., 1.))  # stand_comp
+        b0_sd = numpyro.sample("b0_sd", dist.HalfNormal(1.0))
+        b1_sd = numpyro.sample("b1_sd", dist.HalfNormal(0.1))
+        b2_sd = numpyro.sample("b2_sd", dist.HalfNormal(0.1))
+        b3_sd = numpyro.sample("b3_sd", dist.HalfNormal(0.1))
+        b4_sd = numpyro.sample("b4_sd", dist.HalfNormal(0.1))
+        b5_sd = numpyro.sample("b5_sd", dist.HalfNormal(0.1))
+        b6_sd = numpyro.sample("b6_sd", dist.HalfNormal(0.1))
+        b7_sd = numpyro.sample("b7_sd", dist.HalfNormal(0.1))
+        b8_sd = numpyro.sample("b8_sd", dist.HalfNormal(0.1))
+
+        with numpyro.plate("variants", num_variants):
+            b0 = numpyro.sample("b0", dist.Normal(b0_mu, b0_sd))
+            b1 = numpyro.sample("b1", dist.Normal(b1_mu, b1_sd))  # ln(dbh)
+            b2 = numpyro.sample("b2", dist.Normal(b2_mu, b2_sd))  # dbh**2
+            b3 = numpyro.sample("b3", dist.Normal(b3_mu, b3_sd))  # ln(site_index)
+            b4 = numpyro.sample("b4", dist.Normal(b4_mu, b4_sd))  # slope
+            b5 = numpyro.sample("b5", dist.Normal(b5_mu, b5_sd))  # slope**2
+            b6 = numpyro.sample("b6", dist.Normal(b6_mu, b6_sd))  # slsinasp
+            b7 = numpyro.sample("b7", dist.Normal(b7_mu, b7_sd))  # slcosasp
+            b8 = numpyro.sample("b8", dist.Normal(b8_mu, b8_sd))  # elev
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    if loc_random:
+        with numpyro.plate("locations", num_locations - 1):
+            eloc_ = numpyro.sample(
+                "eloc_", dist.Normal(0, 0.1)
+            )  # random location effect
+        eloc_last = -eloc_.sum()
+        eloc = numpyro.deterministic(
+            "eloc",
+            jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        )
+    else:
+        eloc = 0 * location
+
+    if plot_random:
+        with numpyro.plate("plots", num_plots - 1):
+            eplot_ = numpyro.sample(
+                "eplot_", dist.Normal(0, 0.1)
+            )  # random effect of plot
+        eplot_last = -eplot_.sum()
+        eplot = numpyro.deterministic(
+            "eplot", 
+            jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        )
+    else:
+        eplot = 0 * plot   
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        if pooling == 'pooled':
+            size = b1 * jnp.log(dbh0) + b2 * dbh0**2
+            site = (
+                b3 * jnp.log(site_index) + b4 * slope + b5 * elev**2
+            )
+            comp = b6 * cr_ + b7 * tree_var + b8 * stand_var
+
+            ln_dds_ = b0 + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree))
+        
+        else:
+            size = b1[variant] * jnp.log(dbh0) + b2[variant] * dbh0**2
+            site = (
+                b3[variant] * jnp.log(site_index) + b4[variant] * slope + b5[variant] * elev
+            )
+            comp = b6[variant] * cr_ + b7[variant] * tree_var + b8[variant] * stand_var
+
+            ln_dds_ = b0[variant] + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[variant]))
+        
+        dds = jnp.exp(ln_dds)
+        dib0 = bark_b0 + bark_b1 * dbh0**bark_b2
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0) / bark_b1) ** (1 / bark_b2)
+
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records
+    # assuming FIA meets measurement quality objectives
+    # dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, dbh/20.*0.1/1.65)) 
+    
+    # best estimate of DBH meas error in PNW from Melson et al. (2002)
+    # Melson estimate is about 3.75 times larger than FIA MQO
+    dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, 0.01*dbh))
+    
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = numpyro.deterministic(
+        'real_dbh',
+        jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
+    )
+    
+    meas_dbh_next = numpyro.sample(
+        'meas_dbh_next', 
+        # assuming FIA meets measurement quality objectives
+        # dist.Normal(real_dbh[:, 2], real_dbh[:, 2]/20.*0.1/1.65), 
+        # best estimate of DBH meas error in PNW from Melson et al. (2002)
+        # Melson estimate is about 3.75 times larger than FIA MQO
+        dist.Normal(real_dbh[:, 2], 0.01*real_dbh[:, 2]), 
+        obs=dbh_next
+        # to convert into annualized timestep where observations may or 
+        # may not be available in each year, use something like this...
+        # dist.Normal(
+        #     dbh_series[year_obs, tree_obs], 
+        #     dbh_series[year_obs, tree_obs]*.01
+        # ),
+        # obs=dbh_obs[tree_obs, year_obs]
+    )
+    
+    meas_5yr = numpyro.sample(
+        'meas_5yr', 
+        dist.Normal(
+            radial_growth[1, exist_5yr], 
+            radial_growth[1, exist_5yr]/20./1.65
+        ),
+        obs=obs_5yr[exist_5yr]
+    )
+    
+    meas_10yr = numpyro.sample(
+        'meas_10yr', 
+        dist.Normal(
+            radial_growth[:2, exist_10yr].sum(axis=0), 
+            radial_growth[:2, exist_10yr].sum(axis=0)/20./1.65
+        ),
+        obs=obs_10yr[exist_10yr]
+    )
+    
+    
+def wykoff_model(
+    bark_b0,
+    bark_b1,
+    bark_b2,
+    tree_comp,
+    stand_comp,
+    pooling,
+    loc_random,
+    plot_random,
+    num_variants,
+    num_locations,
+    num_plots,
+    num_cycles,
+    data,
+    dbh_next=None,
+    exist_5yr=None,
+    obs_5yr=None,
+    exist_10yr=None,
+    obs_10yr=None,
+):
+    """A recursive model that predicts diameter growth time series 
+    for individual trees following the general form of Wykoff (1990) 
+    utilizing a five-year timestep along with an optional mixed effects approach
+    for localities and plots following Weiskittel et al., (2007).
+
+    The Wykoff model employs a linear model to predict the log of the
+    difference between squared inside-bark diameter from one timestep to the
+    next. A mixed effects model form is used, with fixed effect for tree size,
+    site variables, and competition variables, and random effects for each
+    location, and for each plot. The model can be fit using an arbitrary number
+    of time steps, and with three alternatives to incorporate hierarchical model
+    structure across ecoregions: fully pooled, fully unpooled, and partially
+    pooled. 
+    
+    Data likelihoods for the model can accomodate three different types of
+    observations: outside bark diameter measurements (DBH), and radial 
+    growth increments measured from years 0-10 or years 5-10. 
+    
+    Measurement error for both DBH and radial increment are incorporated, 
+    resulting in a Bayesian state space model form. 
+
+    Parameters
+    ----------
+    data : list-like
+      predictor variables, expected in the following order:
+      ... TO DO ...
+    tree_comp : str
+      tree_level competion variable to use, options are:
+      'bal', 'relht', or 'ballndbh'.
+    stand_comp : str
+      stand_level competition variable to use, options are:
+      'ba', 'lnba', or 'ccf'
+    num_cycles : int
+      number of five-year steps (or cycles) of growth to simulate
+    bark_b0, bark_b1, bark_b2 : scalar
+      coefficients used to convert diameter outside bark to diameter inside
+      bark, as DIB = b0 + b1*(DBH**b2)
+    obs_dbh : scalar or list-like,
+        observed DBH measurements at 10 years since first measurement
+    exist_5yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 5-yr radial increment 
+        recorded
+    obs_5yr : scalar or list-like with shape (num_trees,)
+        observed five-year radial increments
+    exist_10yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 10-yr radial increment 
+        recorded
+    obs_10yr : scalar or list-like with shape (num_trees,)
+        observed ten-year radial increments
+    """
+    assert pooling in ['pooled', 'unpooled', 'partial']
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    
+    (
+        var_idx,
+        loc_idx,
+        plot_idx,
+        site_index,
+        slope,
+        asp,
+        elev,
+        dbh,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
+    ) = data
+
+    num_trees = dbh.size
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
+    site_index = jnp.asarray(site_index).reshape(-1)
+    slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
+    elev = jnp.asarray(elev).reshape(-1)
+    
+    dbh = jnp.asarray(dbh).reshape(-1)
+    dbh_next = jnp.asarray(dbh_next).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if tree_comp == 'bal':
+        X_tree = bal[:,0]
+    elif tree_comp == 'relht':
+        X_tree = relht[:,0]
+    else:  # tree_comp == 'ballndbh':
+        X_tree = bal[:,0] / jnp.log(dbh + 1.0)
+    
+    if stand_comp == 'ba':
+        X_stand = bapa[:,0]
+    elif stand_comp == 'lnba':
+        X_stand = jnp.log(bapa[:,0])
+    else:  # stand_comp == 'ccf':
+        X_stand = ccf[:,0]
+    
+    X = jnp.array(
+        [
+            jnp.log(dbh),
+            dbh**2,
+            jnp.log(site_index),
+            slope,
+            slope**2,
+            slope * jnp.sin(asp),
+            slope * jnp.cos(asp),
+            elev,
+            elev**2,
+            crown_ratio[:,0],
+            crown_ratio[:,0]**2,
+            X_tree,
+            X_stand,
+        ]
+    )
+    X_mu = X.mean(axis=1)
+    X_sd = X.std(axis=1)
+    
+    if pooling == 'pooled':
+        b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+        b1z = numpyro.sample("b1z", dist.Normal(0., 1.))  # ln(dbh)
+        b2z = numpyro.sample("b2z", dist.Normal(0., 1.))  # dbh**2
+        b3z = numpyro.sample("b3z", dist.Normal(0., 1.))  # ln(site_index)
+        b4z = numpyro.sample("b4z", dist.Normal(0., 1.))  # slope
+        b5z = numpyro.sample("b5z", dist.Normal(0., 1.))  # slope**2
+        b6z = numpyro.sample("b6z", dist.Normal(0., 0.1))  # slsinasp
+        b7z = numpyro.sample("b7z", dist.Normal(0., 0.1))  # slcosasp
+        b8z = numpyro.sample("b8z", dist.Normal(0., 1.))  # elev
+        b9z = numpyro.sample("b9z", dist.Normal(0., 1.))  # elev**2
+        b10z = numpyro.sample("b10z", dist.Normal(0., 1.))  # crown_ratio
+        b11z = numpyro.sample("b11z", dist.Normal(0., 1.))  # crown_ratio**2
+        b12z = numpyro.sample("b12z", dist.Normal(0., 1.))  # tree_comp
+        b13z = numpyro.sample("b13z", dist.Normal(0., 1.))  # stand_comp
+        etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    elif pooling == 'unpooled':
+        with numpyro.plate('variants', num_variants):
+            b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+            b1z = numpyro.sample("b1z", dist.Normal(0.7, 0.25))  # ln(dbh)
+            b2z = numpyro.sample("b2z", dist.Normal(-0.2, 0.25))  # dbh**2
+            b3z = numpyro.sample("b3z", dist.Normal(0.25, 0.25))  # ln(site_index)
+            b4z = numpyro.sample("b4z", dist.Normal(0., 0.25))  # slope
+            b5z = numpyro.sample("b5z", dist.Normal(0., 0.25))  # slope**2
+            b6z = numpyro.sample("b6z", dist.Normal(0., 0.1))  # slsinasp
+            b7z = numpyro.sample("b7z", dist.Normal(0., 0.1))  # slcosasp
+            b8z = numpyro.sample("b8z", dist.Normal(-0.3, 0.25))  # elev
+            b9z = numpyro.sample("b9z", dist.Normal(0.15, 0.25))  # elev**2
+            b10z = numpyro.sample("b10z", dist.Normal(0.8, 0.25))  # crown_ratio
+            b11z = numpyro.sample("b11z", dist.Normal(-0.4, 0.25))  # crown_ratio**2
+            b12z = numpyro.sample("b12z", dist.Normal(0., 0.25))  # tree_comp
+            b13z = numpyro.sample("b13z", dist.Normal(0., 0.25))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    else:  # pooling == 'partial'
+        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(2.5, 0.1))
+        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0.7, 0.1))  # ln(dbh) 
+        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(-0.2, 0.1))  # dbh**2
+        b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0.25, 0.1))  # ln(site_index)
+        b4z_mu = numpyro.sample("b4z_mu", dist.Normal(0., 0.1))  # slope
+        b5z_mu = numpyro.sample("b5z_mu", dist.Normal(0., 0.11))  # slope**2
+        b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0., 0.05))  # slsinasp
+        b7z_mu = numpyro.sample("b7z_mu", dist.Normal(0., 0.05))  # slcosasp
+        b8z_mu = numpyro.sample("b8z_mu", dist.Normal(-0.3, 0.1))  # elev
+        b9z_mu = numpyro.sample("b9z_mu", dist.Normal(0.15, 0.1))  # elev**2
+        b10z_mu = numpyro.sample("b10z_mu", dist.Normal(0.8, 0.1))  # crown_ratio
+        b11z_mu = numpyro.sample("b11z_mu", dist.Normal(-0.4, 0.1))  # crown_ratio**2
+        b12z_mu = numpyro.sample("b12z_mu", dist.Normal(0., 0.25))  # tree_comp
+        b13z_mu = numpyro.sample("b13z_mu", dist.Normal(0., 0.25))  # stand_comp
+        b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
+        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(0.1))
+        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(0.1))
+        b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(0.1))
+        b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(0.1))
+        b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(0.1))
+        b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(0.1))
+        b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(0.1))
+        b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(0.1))
+        b9z_sd = numpyro.sample("b9z_sd", dist.HalfNormal(0.1))
+        b10z_sd = numpyro.sample("b10z_sd", dist.HalfNormal(0.1))
+        b11z_sd = numpyro.sample("b11z_sd", dist.HalfNormal(0.1))
+        b12z_sd = numpyro.sample("b12z_sd", dist.HalfNormal(0.1))
+        b13z_sd = numpyro.sample("b13z_sd", dist.HalfNormal(0.1))
+
+        with numpyro.plate("variants", num_variants):
+            b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
+            b1z = numpyro.sample("b1z", dist.Normal(b1z_mu, b1z_sd))  # ln(dbh)
+            b2z = numpyro.sample("b2z", dist.Normal(b2z_mu, b2z_sd))  # dbh**2
+            b3z = numpyro.sample("b3z", dist.Normal(b3z_mu, b3z_sd))  # ln(site_index)
+            b4z = numpyro.sample("b4z", dist.Normal(b4z_mu, b4z_sd))  # slope
+            b5z = numpyro.sample("b5z", dist.Normal(b5z_mu, b5z_sd))  # slope**2
+            b6z = numpyro.sample("b6z", dist.Normal(b6z_mu, b6z_sd))  # slsinasp
+            b7z = numpyro.sample("b7z", dist.Normal(b7z_mu, b7z_sd))  # slcosasp
+            b8z = numpyro.sample("b8z", dist.Normal(b8z_mu, b8z_sd))  # elev
+            b9z = numpyro.sample("b9z", dist.Normal(b9z_mu, b9z_sd))  # elev**2
+            b10z = numpyro.sample("b10z", dist.Normal(b10z_mu, b10z_sd))  # crown_ratio
+            b11z = numpyro.sample("b11z", dist.Normal(b11z_mu, b11z_sd))  # crown_ratio**2
+            b12z = numpyro.sample("b12z", dist.Normal(b12z_mu, b12z_sd))  # tree_comp
+            b13z = numpyro.sample("b13z", dist.Normal(b13z_mu, b13z_sd))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+
+    b1 = numpyro.deterministic("b1", b1z / X_sd[0])
+    b2 = numpyro.deterministic("b2", b2z / X_sd[1])
+    b3 = numpyro.deterministic("b3", b3z / X_sd[2])
+    b4 = numpyro.deterministic("b4", b4z / X_sd[3])
+    b5 = numpyro.deterministic("b5", b5z / X_sd[4])
+    b6 = numpyro.deterministic("b6", b6z / X_sd[5])
+    b7 = numpyro.deterministic("b7", b7z / X_sd[6])
+    b8 = numpyro.deterministic("b8", b8z / X_sd[7])
+    b9 = numpyro.deterministic("b9", b9z / X_sd[8])
+    b10 = numpyro.deterministic("b10", b10z / X_sd[9])
+    b11 = numpyro.deterministic("b11", b11z / X_sd[10])
+    b12 = numpyro.deterministic("b12", b12z / X_sd[11])
+    b13 = numpyro.deterministic("b13", b13z / X_sd[12])
+    
+    adjust = (
+        b1*X_mu[0] + b2*X_mu[1] + b3*X_mu[2] + b4*X_mu[3]
+        + b5*X_mu[4] + b6*X_mu[5] + b7*X_mu[6] + b8*X_mu[7]
+        + b9*X_mu[8] + b10*X_mu[9] + b11*X_mu[10] 
+        + b12*X_mu[11] + b13*X_mu[12]
+    )
+    b0 = numpyro.deterministic("b0", b0z - adjust)
+    
+    if loc_random:
+        with numpyro.plate("locations", num_locations - 1):
+            eloc_ = numpyro.sample(
+                "eloc_", dist.Normal(0, 0.1)
+            )  # random location effect
+        eloc_last = -eloc_.sum()
+        eloc = numpyro.deterministic(
+            "eloc",
+            jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        )
+    else:
+        eloc = 0 * location
+
+    if plot_random:
+        with numpyro.plate("plots", num_plots - 1):
+            eplot_ = numpyro.sample(
+                "eplot_", dist.Normal(0, 0.1)
+            )  # random effect of plot
+        eplot_last = -eplot_.sum()
+        eplot = numpyro.deterministic(
+            "eplot", 
+            jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        )
+    else:
+        eplot = 0 * plot   
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        if pooling == 'pooled':
+            size = b1 * jnp.log(dbh0) + b2 * dbh0**2
+            site = (
+                b3 * jnp.log(site_index) + b4 * slope + b5 * slope**2 
+                + b6 * slope*jnp.sin(asp) + b7 * slope*jnp.cos(asp) 
+                + b8 * elev + b9 * elev**2
+            )
+            comp = b10 * cr_ + b11 * cr_**2 + b12 * tree_var + b13 * stand_var
+
+            ln_dds_ = b0 + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree))
+        
+        else:
+            size = b1[variant] * jnp.log(dbh0) + b2[variant] * dbh0**2
+            site = (
+                b3[variant] * jnp.log(site_index) + b4[variant] * slope + b5[variant] * slope**2 
+                + b6[variant] * slope*jnp.sin(asp) + b7[variant] * slope*jnp.cos(asp) 
+                + b8[variant] * elev + b9[variant] * elev**2
+            )
+            comp = b10[variant] * cr_ + b11[variant] * cr_**2 + b12[variant] * tree_var + b13[variant] * stand_var
+
+            ln_dds_ = b0[variant] + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[variant]))
+        
+        dds = jnp.exp(ln_dds)
+        dib0 = bark_b0 + bark_b1 * dbh0**bark_b2
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0) / bark_b1) ** (1 / bark_b2)
+
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records
+    # assuming FIA meets measurement quality objectives
+    # dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, dbh/20.*0.1/1.65)) 
+    
+    # best estimate of DBH meas error in PNW from Melson et al. (2002)
+    # Melson estimate is about 3.75 times larger than FIA MQO
+    # error is exponentially distributed, b[0]*dbh**b[1], b=[1.33145993e-04, 2.17862018e+00]
+    dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, 0.01*dbh))
+    
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = numpyro.deterministic(
+        'real_dbh',
+        jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
+    )
+    
+    meas_dbh_next = numpyro.sample(
+        'meas_dbh_next', 
+        # assuming FIA meets measurement quality objectives
+        # dist.Normal(real_dbh[:, 2], real_dbh[:, 2]/20.*0.1/1.65), 
+        # best estimate of DBH meas error in PNW from Melson et al. (2002)
+        # Melson estimate is about 3.75 times larger than FIA MQO
+        dist.Normal(real_dbh[:, 2], 0.01*real_dbh[:, 2]), 
+        obs=dbh_next
+        # to convert into annualized timestep where observations may or 
+        # may not be available in each year, use something like this...
+        # dist.Normal(
+        #     dbh_series[year_obs, tree_obs], 
+        #     dbh_series[year_obs, tree_obs]*.01
+        # ),
+        # obs=dbh_obs[tree_obs, year_obs]
+    )
+    
+    meas_5yr = numpyro.sample(
+        'meas_5yr', 
+        dist.Normal(
+            radial_growth[1, exist_5yr], 
+            radial_growth[1, exist_5yr]/20./1.65
+        ),
+        obs=obs_5yr[exist_5yr]
+    )
+    
+    meas_10yr = numpyro.sample(
+        'meas_10yr', 
+        dist.Normal(
+            radial_growth[:2, exist_10yr].sum(axis=0), 
+            radial_growth[:2, exist_10yr].sum(axis=0)/20./1.65
+        ),
+        obs=obs_10yr[exist_10yr]
+    )
+
+    
+def simpler_wykoff_model(
+    bark_b0,
+    bark_b1,
+    bark_b2,
+    tree_comp,
+    stand_comp,
+    pooling,
+    loc_random,
+    plot_random,
+    num_variants,
+    num_locations,
+    num_plots,
+    num_cycles,
+    data,
+    dbh_next=None,
+    exist_5yr=None,
+    obs_5yr=None,
+    exist_10yr=None,
+    obs_10yr=None,
+):
+    """A recursive model that predicts diameter growth time series 
+    for individual trees following the general form of Wykoff (1990) 
+    utilizing a five-year timestep along with an optional mixed effects approach
+    for localities and plots following Weiskittel et al., (2007).
+
+    The Wykoff model employs a linear model to predict the log of the
+    difference between squared inside-bark diameter from one timestep to the
+    next. A mixed effects model form is used, with fixed effect for tree size,
+    site variables, and competition variables, and random effects for each
+    location, and for each plot. The model can be fit using an arbitrary number
+    of time steps, and with three alternatives to incorporate hierarchical model
+    structure across ecoregions: fully pooled, fully unpooled, and partially
+    pooled. 
+    
+    Data likelihoods for the model can accomodate three different types of
+    observations: outside bark diameter measurements (DBH), and radial 
+    growth increments measured from years 0-10 or years 5-10. 
+    
+    Measurement error for both DBH and radial increment are incorporated, 
+    resulting in a Bayesian state space model form. 
+
+    Parameters
+    ----------
+    data : list-like
+      predictor variables, expected in the following order:
+      ... TO DO ...
+    tree_comp : str
+      tree_level competion variable to use, options are:
+      'bal', 'relht', or 'ballndbh'.
+    stand_comp : str
+      stand_level competition variable to use, options are:
+      'ba', 'lnba', or 'ccf'
+    num_cycles : int
+      number of five-year steps (or cycles) of growth to simulate
+    bark_b0, bark_b1, bark_b2 : scalar
+      coefficients used to convert diameter outside bark to diameter inside
+      bark, as DIB = b0 + b1*(DBH**b2)
+    obs_dbh : scalar or list-like,
+        observed DBH measurements at 10 years since first measurement
+    exist_5yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 5-yr radial increment 
+        recorded
+    obs_5yr : scalar or list-like with shape (num_trees,)
+        observed five-year radial increments
+    exist_10yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 10-yr radial increment 
+        recorded
+    obs_10yr : scalar or list-like with shape (num_trees,)
+        observed ten-year radial increments
+    """
+    assert pooling in ['pooled', 'unpooled', 'partial']
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    
+    (
+        var_idx,
+        loc_idx,
+        plot_idx,
+        site_index,
+        slope,
+        asp,
+        elev,
+        dbh,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
+    ) = data
+
+    num_trees = dbh.size
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
+    site_index = jnp.asarray(site_index).reshape(-1)
+    slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
+    elev = jnp.asarray(elev).reshape(-1)
+    
+    dbh = jnp.asarray(dbh).reshape(-1)
+    dbh_next = jnp.asarray(dbh_next).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if tree_comp == 'bal':
+        X_tree = bal[:,0]
+    elif tree_comp == 'relht':
+        X_tree = relht[:,0]
+    else:  # tree_comp == 'ballndbh':
+        X_tree = bal[:,0] / jnp.log(dbh + 1.0)
+    
+    if stand_comp == 'ba':
+        X_stand = bapa[:,0]
+    elif stand_comp == 'lnba':
+        X_stand = jnp.log(bapa[:,0])
+    else:  # stand_comp == 'ccf':
+        X_stand = ccf[:,0]
+    
     X = jnp.array(
         [
             jnp.log(dbh),
@@ -109,60 +1272,58 @@ def wykoff_model(
             jnp.log(site_index),
             slope,
             elev,
-            cr_start,
-            comp_tree_start,
-            comp_stand_start,
+            crown_ratio[:,0],
+            X_tree,
+            X_stand,
         ]
     )
     X_mu = X.mean(axis=1)
     X_sd = X.std(axis=1)
-
-    if pooling == "pooled":
-        b0z = numpyro.sample("b0z", dist.Normal(0.9, 2.0))
-        b1z = numpyro.sample("b1z", dist.Normal(0.7, 1.0))  # ln(dbh)
-        b2z = numpyro.sample("b2z", dist.Normal(-0.1, 1.0))  # dbh**2
-        b3z = numpyro.sample("b3z", dist.Normal(0.3, 1.0))  # ln(site_index)
-        b4z = numpyro.sample("b4z", dist.Normal(-0.04, 1.0))  # slope
-        b5z = numpyro.sample("b5z", dist.Normal(-0.1, 1.0))  # elev
-        b6z = numpyro.sample("b6z", dist.Normal(0.4, 1.0))  # crown_ratio
-        b7z = numpyro.sample(
-            "b7z", dist.Normal(-0.4, 1.0)
-        )  # comp_tree  # BAL / ln(dbh+1)
-        b8z = numpyro.sample("b8z", dist.Normal(0.0, 1.0))  # comp_stand  # ln(BA)
-
-    elif pooling == "unpooled":
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(0.9, 2.0))
-            b1z = numpyro.sample("b1z", dist.Normal(0.7, 1.0))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(-0.1, 1.0))  # dbh**2
-            b3z = numpyro.sample("b3z", dist.Normal(0.3, 1.0))  # ln(site_index)
-            b4z = numpyro.sample("b4z", dist.Normal(-0.04, 1.0))  # slope
-            b5z = numpyro.sample("b5z", dist.Normal(-0.1, 1.0))  # elev
-            b6z = numpyro.sample("b6z", dist.Normal(0.4, 1.0))  # crown_ratio
-            b7z = numpyro.sample(
-                "b7z", dist.Normal(-0.4, 1.0)
-            )  # comp_tree  # BAL / ln(dbh+1)
-            b8z = numpyro.sample("b8z", dist.Normal(0.0, 1.0))  # comp_stand  # ln(BA)
-
-    elif pooling == "partial":
-        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(0.9, 0.5))
-        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0.7, 0.3))
-        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(-0.1, 0.1))
-        b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0.3, 0.1))
-        b4z_mu = numpyro.sample("b4z_mu", dist.Normal(-0.04, 0.1))
-        b5z_mu = numpyro.sample("b5z_mu", dist.Normal(-0.1, 0.1))
-        b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0.4, 0.1))
-        b7z_mu = numpyro.sample("b7z_mu", dist.Normal(-0.4, 0.1))
-        b8z_mu = numpyro.sample("b8z_mu", dist.Normal(0.0, 0.1))
+    
+    if pooling == 'pooled':
+        b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+        b1z = numpyro.sample("b1z", dist.Normal(0., 1.))  # ln(dbh)
+        b2z = numpyro.sample("b2z", dist.Normal(0., 1.))  # dbh**2
+        b3z = numpyro.sample("b3z", dist.Normal(0., 1.))  # ln(site_index)
+        b4z = numpyro.sample("b4z", dist.Normal(0., 1.))  # slope
+        b5z = numpyro.sample("b5z", dist.Normal(0., 1.))  # elev
+        b6z = numpyro.sample("b6z", dist.Normal(0., 1.))  # crown_ratio
+        b7z = numpyro.sample("b7z", dist.Normal(0., 1.))  # tree_comp
+        b8z = numpyro.sample("b8z", dist.Normal(0., 1.))  # stand_comp
+        etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    elif pooling == 'unpooled':
+        with numpyro.plate('variants', num_variants):
+            b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+            b1z = numpyro.sample("b1z", dist.Normal(0.7, 0.25))  # ln(dbh)
+            b2z = numpyro.sample("b2z", dist.Normal(-0.2, 0.25))  # dbh**2
+            b3z = numpyro.sample("b3z", dist.Normal(0.25, 0.25))  # ln(site_index)
+            b4z = numpyro.sample("b4z", dist.Normal(0., 0.25))  # slope
+            b5z = numpyro.sample("b5z", dist.Normal(-0.3, 0.25))  # elev
+            b6z = numpyro.sample("b6z", dist.Normal(0.8, 0.25))  # crown_ratio
+            b7z = numpyro.sample("b7z", dist.Normal(0., 0.25))  # tree_comp
+            b8z = numpyro.sample("b8z", dist.Normal(0., 0.25))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    else:  # pooling == 'partial'
+        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(2.5, 0.1))
+        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0.7, 0.1))  # ln(dbh) 
+        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(-0.2, 0.1))  # dbh**2
+        b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0.25, 0.1))  # ln(site_index)
+        b4z_mu = numpyro.sample("b4z_mu", dist.Normal(0., 0.1))  # slope
+        b5z_mu = numpyro.sample("b5z_mu", dist.Normal(-0.3, 0.1))  # elev
+        b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0.8, 0.1))  # crown_ratio
+        b7z_mu = numpyro.sample("b7z_mu", dist.Normal(0., 0.25))  # tree_comp
+        b8z_mu = numpyro.sample("b8z_mu", dist.Normal(0., 0.25))  # stand_comp
         b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
-        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(0.05))
-        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(0.05))
-        b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(0.05))
-        b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(0.05))
-        b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(0.05))
-        b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(0.05))
-        b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(0.05))
-        b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(0.05))
+        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(0.1))
+        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(0.1))
+        b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(0.1))
+        b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(0.1))
+        b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(0.1))
+        b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(0.1))
+        b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(0.1))
+        b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(0.1))
 
         with numpyro.plate("variants", num_variants):
             b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
@@ -171,19 +1332,10 @@ def wykoff_model(
             b3z = numpyro.sample("b3z", dist.Normal(b3z_mu, b3z_sd))  # ln(site_index)
             b4z = numpyro.sample("b4z", dist.Normal(b4z_mu, b4z_sd))  # slope
             b5z = numpyro.sample("b5z", dist.Normal(b5z_mu, b5z_sd))  # elev
-            b6z = numpyro.sample("b6z", dist.Normal(b6z_mu, b6z_sd))  # crown_ratio
-            b7z = numpyro.sample(
-                "b7z", dist.Normal(b7z_mu, b7z_sd)
-            )  # comp_tree  # BAL / ln(dbh+1)
-            b8z = numpyro.sample(
-                "b8z", dist.Normal(b8z_mu, b8z_sd)
-            )  # comp_stand  # ln(BA)
-    else:
-        raise (
-            ValueError(
-                "valid options for pooling are 'unpooled', 'pooled', or 'partial'"
-            )
-        )
+            b6z = numpyro.sample("b6z", dist.Normal(b6z_mu, b6z_sd))  # crown_ratio  
+            b7z = numpyro.sample("b7z", dist.Normal(b7z_mu, b7z_sd))  # tree_comp
+            b8z = numpyro.sample("b8z", dist.Normal(b8z_mu, b8z_sd))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
 
     b1 = numpyro.deterministic("b1", b1z / X_sd[0])
     b2 = numpyro.deterministic("b2", b2z / X_sd[1])
@@ -193,352 +1345,262 @@ def wykoff_model(
     b6 = numpyro.deterministic("b6", b6z / X_sd[5])
     b7 = numpyro.deterministic("b7", b7z / X_sd[6])
     b8 = numpyro.deterministic("b8", b8z / X_sd[7])
-
-    adjust = b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8
+    
+    adjust = (
+        b1*X_mu[0] + b2*X_mu[1] + b3*X_mu[2] + b4*X_mu[3]
+        + b5*X_mu[4] + b6*X_mu[5] + b7*X_mu[6] + b8*X_mu[7]
+    )
     b0 = numpyro.deterministic("b0", b0z - adjust)
-
+    
     if loc_random:
         with numpyro.plate("locations", num_locations - 1):
             eloc_ = numpyro.sample(
-                "eloc", dist.Normal(0, 0.1)
+                "eloc_", dist.Normal(0, 0.1)
             )  # random location effect
-        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
-        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        eloc_last = -eloc_.sum()
+        eloc = numpyro.deterministic(
+            "eloc",
+            jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        )
     else:
-        eloc = 0 * loc
+        eloc = 0 * location
 
     if plot_random:
         with numpyro.plate("plots", num_plots - 1):
             eplot_ = numpyro.sample(
-                "eplot", dist.Normal(0, 0.1)
+                "eplot_", dist.Normal(0, 0.1)
             )  # random effect of plot
-        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
-        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        eplot_last = -eplot_.sum()
+        eplot = numpyro.deterministic(
+            "eplot", 
+            jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        )
     else:
-        eplot = 0 * plot
-
-    def step(dbh, step_covars):
-        crown_ratio, comp_tree, comp_stand = step_covars
-        if pooling == "pooled":
-            size = b1 * jnp.log(dbh) + b2 * dbh**2
-            site = b3 * jnp.log(site_index) + b4 * slope + b5 * elev
-            comp = b6 * crown_ratio + b7 * comp_tree + b8 * comp_stand
-
-            ln_dds = b0 + size + site + comp + eloc[loc] + eplot[plot]
-
-        else:
-            size = b1[variant] * jnp.log(dbh) + b2[variant] * dbh**2
+        eplot = 0 * plot   
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        if pooling == 'pooled':
+            size = b1 * jnp.log(dbh0) + b2 * dbh0**2
             site = (
-                b3[variant] * jnp.log(site_index)
-                + b4[variant] * slope
+                b3 * jnp.log(site_index) + b4 * slope + b5 * elev
+            )
+            comp = b6 * cr_ + b7 * tree_var + b8 * stand_var
+
+            ln_dds_ = b0 + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree))
+        
+        else:
+            size = b1[variant] * jnp.log(dbh0) + b2[variant] * dbh0**2
+            site = (
+                b3[variant] * jnp.log(site_index) + b4[variant] * slope 
                 + b5[variant] * elev
             )
-            comp = (
-                b6[variant] * crown_ratio
-                + b7[variant] * comp_tree
-                + b8[variant] * comp_stand
-            )
+            comp = b6[variant] * cr_ + b7[variant] * tree_var + b8[variant] * stand_var
 
-            ln_dds = b0[variant] + size + site + comp + eloc[loc] + eplot[plot]
-
+            ln_dds_ = b0[variant] + size + site + comp + eloc[location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[variant]))
+        
         dds = jnp.exp(ln_dds)
-        dib_start = bark_b1 * dbh**bark_b2
-        dib_end = jnp.sqrt(dib_start**2 + dds)
-        dbh_end = (dib_end / bark_b1) ** (1 / bark_b2)
-        dg_ob = dbh_end - dbh
+        dib0 = bark_b0 + bark_b1 * dbh0**bark_b2
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0) / bark_b1) ** (1 / bark_b2)
 
-        return dbh_end, dg_ob
-
-    step_covars = (crown_ratio, comp_tree, comp_stand)
-    dbh_end, growth = scan(step, dbh, step_covars, length=num_cycles)
-    dg_pred = numpyro.deterministic("dg_pred", dbh_end - dbh)
-    bai_pred = numpyro.deterministic("bai_pred", jnp.pi / 4 * (dbh_end**2 - dbh**2))
-
-    if target.lower() == "bai":
-        etree_bai = numpyro.sample("etree_bai", dist.Gamma(4.0, 0.1))
-        obs = numpyro.sample("obs", dist.Cauchy(bai_pred, etree_bai), obs=y)
-    elif target.lower() == "dg":
-        etree_dg = numpyro.sample("etree_dg", dist.InverseGamma(2.0, 0.25))
-        obs = numpyro.sample("obs", dist.Laplace(dg_pred, etree_dg), obs=y)
-
-    if y is not None:
-        if target.lower() == "bai":
-            bai_obs = y
-            dbh_end_obs = jnp.sqrt(4 / jnp.pi * bai_obs + dbh**2)
-            dg_obs = dbh_end_obs - dbh
-
-        elif target.lower() == "dg":
-            dg_obs = y
-            bai_obs = jnp.pi / 4 * ((dbh + dg_obs) ** 2 - dbh**2)
-
-        bai_resid = numpyro.deterministic("bai_resid", bai_pred - bai_obs)
-        bai_ss_res = ((bai_obs - bai_pred) ** 2).sum()
-        bai_ss_tot = ((bai_obs - bai_obs.mean()) ** 2).sum()
-        bai_r2 = numpyro.deterministic("bai_r2", 1 - bai_ss_res / bai_ss_tot)
-        bai_bias = numpyro.deterministic("bai_bias", bai_resid.mean())
-        bai_mae = numpyro.deterministic("bai_mae", jnp.abs(bai_resid).mean())
-        bai_rmse = numpyro.deterministic(
-            "bai_rmse", jnp.sqrt((bai_resid**2).sum() / num_trees)
-        )
-        dg_resid = numpyro.deterministic("dg_resid", dg_pred - dg_obs)
-        dg_ss_res = ((dg_obs - dg_pred) ** 2).sum()
-        dg_ss_tot = ((dg_obs - dg_obs.mean()) ** 2).sum()
-        dg_r2 = numpyro.deterministic("dg_r2", 1 - dg_ss_res / dg_ss_tot)
-        dg_bias = numpyro.deterministic("dg_bias", dg_resid.mean())
-        dg_mae = numpyro.deterministic("dg_mae", jnp.abs(dg_resid).mean())
-        dg_rmse = numpyro.deterministic(
-            "dg_rmse", jnp.sqrt((dg_resid**2).sum() / num_trees)
-        )
-
-
-def potential_growth_model(
-    data,
-    num_cycles,
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records
+    # assuming FIA meets measurement quality objectives
+    # dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, dbh/20.*0.1/1.65)) 
+    
+    # best estimate of DBH meas error in PNW from Melson et al. (2002)
+    # Melson estimate is about 3.75 times larger than FIA MQO
+    # error is exponentially distributed, b[0]*dbh**b[1], b=[1.33145993e-04, 2.17862018e+00]
+    dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, 0.01*dbh))
+    
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = numpyro.deterministic(
+        'real_dbh',
+        jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
+    )
+    
+    meas_dbh_next = numpyro.sample(
+        'meas_dbh_next', 
+        # assuming FIA meets measurement quality objectives
+        # dist.Normal(real_dbh[:, 2], real_dbh[:, 2]/20.*0.1/1.65), 
+        # best estimate of DBH meas error in PNW from Melson et al. (2002)
+        # Melson estimate is about 3.75 times larger than FIA MQO
+        dist.Normal(real_dbh[:, 2], 0.01*real_dbh[:, 2]), 
+        obs=dbh_next
+        # to convert into annualized timestep where observations may or 
+        # may not be available in each year, use something like this...
+        # dist.Normal(
+        #     dbh_series[year_obs, tree_obs], 
+        #     dbh_series[year_obs, tree_obs]*.01
+        # ),
+        # obs=dbh_obs[tree_obs, year_obs]
+    )
+    
+    meas_5yr = numpyro.sample(
+        'meas_5yr', 
+        dist.Normal(
+            radial_growth[1, exist_5yr], 
+            radial_growth[1, exist_5yr]/20./1.65
+        ),
+        obs=obs_5yr[exist_5yr]
+    )
+    
+    meas_10yr = numpyro.sample(
+        'meas_10yr', 
+        dist.Normal(
+            radial_growth[:2, exist_10yr].sum(axis=0), 
+            radial_growth[:2, exist_10yr].sum(axis=0)/20./1.65
+        ),
+        obs=obs_10yr[exist_10yr]
+    )
+    
+def simpler_wykoff_multispecies_model(
+    bark_b0,
     bark_b1,
     bark_b2,
+    tree_comp,
+    stand_comp,
+    pooling,
+    loc_random,
+    plot_random,
+    num_species,
     num_variants,
     num_locations,
     num_plots,
-    y=None,
-    target="dg",
-    pooling="pooled",
-    loc_random=False,
-    plot_random=False,
-    quantile=0.95,
+    num_cycles,
+    data,
+    dbh_next=None,
+    exist_5yr=None,
+    obs_5yr=None,
+    exist_10yr=None,
+    obs_10yr=None,
 ):
-    """A recursive model that predicts potential diameter growth or
-    basal area increment for individual trees adapted from the general
-    form of Wykoff (1990), with annualization inspired by Cao (2000, 2004),
-    and optional mixed effects following the approach illustrated by
-    Weiskittel et al., (2007).
+    """A recursive model that predicts diameter growth time series 
+    for individual trees following the general form of Wykoff (1990) 
+    utilizing a five-year timestep along with an optional mixed effects approach
+    for localities and plots following Weiskittel et al., (2007).
+
+    The Wykoff model employs a linear model to predict the log of the
+    difference between squared inside-bark diameter from one timestep to the
+    next. A mixed effects model form is used, with fixed effect for tree size,
+    site variables, and competition variables, and random effects for each
+    location, and for each plot. The model can be fit using an arbitrary number
+    of time steps, and with three alternatives to incorporate hierarchical model
+    structure across ecoregions: fully pooled, fully unpooled, and partially
+    pooled. 
+    
+    Data likelihoods for the model can accomodate three different types of
+    observations: outside bark diameter measurements (DBH), and radial 
+    growth increments measured from years 0-10 or years 5-10. 
+    
+    Measurement error for both DBH and radial increment are incorporated, 
+    resulting in a Bayesian state space model form. 
 
     Parameters
     ----------
     data : list-like
       predictor variables, expected in the following order:
-          1. variant_index
-          2. location_index
-          3. plot_index
-          4. dbh
+      ... TO DO ...
+    tree_comp : str
+      tree_level competion variable to use, options are:
+      'bal', 'relht', or 'ballndbh'.
+    stand_comp : str
+      stand_level competition variable to use, options are:
+      'ba', 'lnba', or 'ccf'
     num_cycles : int
-      number of steps (or cycles) of growth to simulate
-    bark_b1, bark_b2 : scalar
+      number of five-year steps (or cycles) of growth to simulate
+    bark_b0, bark_b1, bark_b2 : scalar
       coefficients used to convert diameter outside bark to diameter inside
-      bark, as DIB = b1*(DBH**b2)
-    num_variants : int
-      number of distinct variants or ecoregions across dataset
-    num_locations : int
-      number of distinct locations across dataset, modeled as a random effect
-    num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
-    y : scalar or list-like
-      observed outside-bark diameter growth or basal area increment
-    target : str
-      type of target variable, may be 'bai' or 'dg'
-    pooling : str
-      degree of pooling for model covariates across variants/ecoregions, valid
-      are 'unpooled', 'pooled', or 'partial'.
+      bark, as DIB = b0 + b1*(DBH**b2)
+    obs_dbh : scalar or list-like,
+        observed DBH measurements at 10 years since first measurement
+    exist_5yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 5-yr radial increment 
+        recorded
+    obs_5yr : scalar or list-like with shape (num_trees,)
+        observed five-year radial increments
+    exist_10yr : bool or list-like of bools, shape (num_trees,)
+        boolean value or array indicating trees that have 10-yr radial increment 
+        recorded
+    obs_10yr : scalar or list-like with shape (num_trees,)
+        observed ten-year radial increments
     """
-    (variant, loc, plot, dbh) = data
-
-    dbh = jnp.asarray(dbh).reshape(-1)
-    y = jnp.asarray(y).reshape(-1)
-    num_trees = dbh.size
-    variant = jnp.asarray(variant).reshape(-1)
-    loc = jnp.asarray(loc).reshape(-1)
-    plot = jnp.asarray(plot).reshape(-1)
-
-    X = jnp.array([jnp.log(dbh), dbh**2])
-    X_mu = X.mean(axis=1)
-    X_sd = X.std(axis=1)
-
-    if pooling == "pooled":
-        b0z = numpyro.sample("b0z", dist.Normal(0.0, 1.0))
-        b1z = numpyro.sample("b1z", dist.Normal(0.0, 1.0))  # ln(dbh)
-        b2z = numpyro.sample("b2z", dist.Normal(0.0, 1.0))  # dbh**2
-
-    elif pooling == "unpooled":
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(0.0, 1.0))
-            b1z = numpyro.sample("b1z", dist.Normal(0.0, 1.0))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(0.0, 1.0))  # dbh**2
-
-    elif pooling == "partial":
-        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(0.0, 1.0))
-        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0.0, 1.0))
-        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(0.0, 1.0))
-        b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
-        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(1.0))
-        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(1.0))
-
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
-            b1z = numpyro.sample("b1z", dist.Normal(b1z_mu, b1z_sd))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(b2z_mu, b2z_sd))  # dbh**2
-
-    else:
-        raise (
-            ValueError(
-                "valid options for pooling are 'unpooled', 'pooled', or 'partial'"
-            )
-        )
-
-    b1 = numpyro.deterministic("b1", b1z / X_sd[0])
-    b2 = numpyro.deterministic("b2", b2z / X_sd[1])
-    adjust = b1 + b2
-    b0 = numpyro.deterministic("b0", b0z - adjust)
-
-    if loc_random:
-        with numpyro.plate("locations", num_locations - 1):
-            eloc_ = numpyro.sample(
-                "eloc", dist.Normal(0, 0.1)
-            )  # random location effect
-        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
-        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
-    else:
-        eloc = 0 * loc
-
-    if plot_random:
-        with numpyro.plate("plots", num_plots - 1):
-            eplot_ = numpyro.sample(
-                "eplot", dist.Normal(0, 0.1)
-            )  # random effect of plot
-        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
-        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
-    else:
-        eplot = 0 * plot
-
-    def step(dbh, step_covars=None):
-        if pooling == "pooled":
-            ln_dds = b0 + b1 * jnp.log(dbh) + b2 * dbh**2 + eloc[loc] + eplot[plot]
-
-        else:
-            ln_dds = (
-                b0
-                + b1[variant] * jnp.log(dbh)
-                + b2[variant] * dbh**2
-                + eloc[loc]
-                + eplot[plot]
-            )
-
-        dds = jnp.exp(ln_dds)
-        dib_start = bark_b1 * dbh**bark_b2
-        dib_end = jnp.sqrt(dib_start**2 + dds)
-        dbh_end = (dib_end / bark_b1) ** (1 / bark_b2)
-        dg_ob = dbh_end - dbh
-
-        return dbh_end, dg_ob
-
-    step_covars = None
-    dbh_end, growth = scan(step, dbh, step_covars, length=num_cycles)
-
-    dg_pred = numpyro.deterministic("dg_pred", dbh_end - dbh)
-    bai_pred = numpyro.deterministic("bai_pred", jnp.pi / 4 * (dbh_end**2 - dbh**2))
-
-    if target.lower() == "bai":
-        etree_bai = numpyro.sample("etree_bai", dist.Gamma(4.0, 0.1))
-        obs = numpyro.sample(
-            "obs",
-            dist.AsymmetricLaplaceQuantile(bai_pred, etree_bai, quantile=quantile),
-            obs=y,
-        )
-    elif target.lower() == "dg":
-        etree_dg = numpyro.sample("etree_dg", dist.InverseGamma(2.0, 0.25))
-        obs = numpyro.sample(
-            "obs",
-            dist.AsymmetricLaplaceQuantile(dg_pred, etree_dg, quantile=quantile),
-            obs=y,
-        )
-
-
-def potential_modified_model(
-    data,
-    num_cycles,
-    bark_b1,
-    bark_b2,
-    num_variants,
-    num_locations,
-    num_plots,
-    y=None,
-    target="dg",
-    pooling="pooled",
-    loc_random=False,
-    plot_random=False,
-):
-    """A recursive model that predicts diameter growth or basal area increment
-    for individual trees adapted from the general form of Wykoff (1990), with
-    annualization inspired by Cao (2000, 2004), and optional mixed effects
-    following the approach illustrated by Weiskittel et al., (2007).
-
-    Fixed effects are transformed such that increasing magnitude of the
-    predictor variable should correspond to decreased growth to approximate
-    a POTENTIAL*MODIFIER growth form.
-
-    Parameters
-    ----------
-    data : list-like
-      predictor variables, expected in the following order:
-          1. variant_index
-          2. location_index
-          3. plot_index
-          4. site_index
-          5. slope, in percent, where 100% slope = 1.0
-          6. elevation
-          7. dbh
-          8. crown_ratio_start, as a proportion, where 100% = 1.0
-          9. crown_ratio_end, as a proportion, where 100% = 1.0
-          10. competition_treelevel_start
-          11. competition_treelevel_end
-          12. competition_standlevel_start
-          13. competition_standlevel_end
-    num_cycles : int
-      number of steps (or cycles) of growth to simulate
-    bark_b1, bark_b2 : scalar
-      coefficients used to convert diameter outside bark to diameter inside
-      bark, as DIB = b1*(DBH**b2)
-    num_variants : int
-      number of distinct variants or ecoregions across dataset
-    num_locations : int
-      number of distinct locations across dataset, modeled as a random effect
-    num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
-    y : scalar or list-like
-      observed outside-bark diameter growth
-    target : str
-      type of target variable, may be 'bai' or 'dg'
-    pooling : str
-      degree of pooling for model covariates across variants/ecoregions, valid
-      are 'unpooled', 'pooled', or 'partial'.
-    """
+    assert pooling in ['pooled', 'unpooled', 'partial']
+    assert tree_comp in ['bal', 'ballndbh', 'relht']
+    assert stand_comp in ['ba', 'lnba', 'ccf']
+    
     (
-        variant,
-        loc,
-        plot,
+        spp_idx,  # added this variable compared to single-species wykoff
+        var_idx,
+        loc_idx,
+        plot_idx,
         site_index,
         slope,
+        asp,
         elev,
         dbh,
-        cr_start,
-        cr_end,
-        comp_tree_start,
-        comp_tree_end,
-        comp_stand_start,
-        comp_stand_end,
+        crown_ratio,
+        bal,
+        relht,
+        bapa,
+        ccf
     ) = data
-
-    dbh = jnp.asarray(dbh).reshape(-1)
-    y = jnp.asarray(y).reshape(-1)
+    
+    bark_b0 = jnp.asarray(bark_b0).reshape(-1)
+    bark_b1 = jnp.asarray(bark_b1).reshape(-1)
+    bark_b2 = jnp.asarray(bark_b2).reshape(-1)
     num_trees = dbh.size
-    variant = jnp.asarray(variant).reshape(-1)
-    loc = jnp.asarray(loc).reshape(-1)
-    plot = jnp.asarray(plot).reshape(-1)
-    site_index = 250 / jnp.asarray(site_index).reshape(-1)
+    spp = jnp.asarray(spp_idx).reshape(-1)
+    variant = jnp.asarray(var_idx).reshape(-1)
+    location = jnp.asarray(loc_idx).reshape(-1)
+    plot = jnp.asarray(plot_idx).reshape(-1)
+    site_index = jnp.asarray(site_index).reshape(-1)
     slope = jnp.asarray(slope).reshape(-1)
+    asp = jnp.asarray(asp).reshape(-1)
     elev = jnp.asarray(elev).reshape(-1)
-    crown_ratio = jnp.linspace(1 - cr_start, 1 - cr_end, num_cycles)
-    comp_tree = jnp.linspace(comp_tree_start, comp_tree_end, num_cycles)
-    comp_stand = jnp.linspace(comp_stand_start, comp_stand_end, num_cycles)
-
+    
+    dbh = jnp.asarray(dbh).reshape(-1)
+    dbh_next = jnp.asarray(dbh_next).reshape(-1)
+    crown_ratio = jnp.asarray(crown_ratio)
+    bal = jnp.asarray(bal)
+    relht = jnp.asarray(relht)
+    bapa = jnp.asarray(bapa)
+    ccf = jnp.asarray(ccf)
+    
+    if tree_comp == 'bal':
+        X_tree = bal[:,0]
+    elif tree_comp == 'relht':
+        X_tree = relht[:,0]
+    else:  # tree_comp == 'ballndbh':
+        X_tree = bal[:,0] / jnp.log(dbh + 1.0)
+    
+    if stand_comp == 'ba':
+        X_stand = bapa[:,0]
+    elif stand_comp == 'lnba':
+        X_stand = jnp.log(bapa[:,0])
+    else:  # stand_comp == 'ccf':
+        X_stand = ccf[:,0]
+    
     X = jnp.array(
         [
             jnp.log(dbh),
@@ -546,87 +1608,77 @@ def potential_modified_model(
             jnp.log(site_index),
             slope,
             elev,
-            1 - cr_start,
-            comp_tree_start,
-            comp_stand_start,
+            crown_ratio[:,0],
+            X_tree,
+            X_stand,
         ]
     )
     X_mu = X.mean(axis=1)
     X_sd = X.std(axis=1)
+    
+    plate_spp = numpyro.plate('species', num_species, dim=-2)
+    plate_var = numpyro.plate('variants', num_variants, dim=-1)
+    
+    if pooling == 'pooled':
+        with plate_spp:
+            b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+            b1z = numpyro.sample("b1z", dist.Normal(0., 1.))  # ln(dbh)
+            b2z = numpyro.sample("b2z", dist.Normal(0., 1.))  # dbh**2
+            b3z = numpyro.sample("b3z", dist.Normal(0., 1.))  # ln(site_index)
+            b4z = numpyro.sample("b4z", dist.Normal(0., 1.))  # slope
+            b5z = numpyro.sample("b5z", dist.Normal(0., 1.))  # elev
+            b6z = numpyro.sample("b6z", dist.Normal(0., 1.))  # crown_ratio
+            b7z = numpyro.sample("b7z", dist.Normal(0., 1.))  # tree_comp
+            b8z = numpyro.sample("b8z", dist.Normal(0., 1.))  # stand_comp
+            etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    elif pooling == 'unpooled':
+        with plate_spp:
+            with plate_var:
+                b0z = numpyro.sample("b0z", dist.Normal(2.5, 0.25))
+                b1z = numpyro.sample("b1z", dist.Normal(0.7, 0.25))  # ln(dbh)
+                b2z = numpyro.sample("b2z", dist.Normal(-0.2, 0.25))  # dbh**2
+                b3z = numpyro.sample("b3z", dist.Normal(0.25, 0.25))  # ln(site_index)
+                b4z = numpyro.sample("b4z", dist.Normal(0., 0.25))  # slope
+                b5z = numpyro.sample("b5z", dist.Normal(-0.3, 0.25))  # elev
+                b6z = numpyro.sample("b6z", dist.Normal(0.8, 0.25))  # crown_ratio
+                b7z = numpyro.sample("b7z", dist.Normal(0., 0.25))  # tree_comp
+                b8z = numpyro.sample("b8z", dist.Normal(0., 0.25))  # stand_comp
+                etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+    
+    else:  # pooling == 'partial'
+        with plate_spp:
+            b0z_mu = numpyro.sample("b0z_mu", dist.Normal(2.5, 0.1))
+            b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0.7, 0.1))  # ln(dbh) 
+            b2z_mu = numpyro.sample("b2z_mu", dist.Normal(-0.2, 0.1))  # dbh**2
+            b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0.25, 0.1))  # ln(site_index)
+            b4z_mu = numpyro.sample("b4z_mu", dist.Normal(0., 0.1))  # slope
+            b5z_mu = numpyro.sample("b5z_mu", dist.Normal(-0.3, 0.1))  # elev
+            b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0.8, 0.1))  # crown_ratio
+            b7z_mu = numpyro.sample("b7z_mu", dist.Normal(0., 0.25))  # tree_comp
+            b8z_mu = numpyro.sample("b8z_mu", dist.Normal(0., 0.25))  # stand_comp
+            b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
+            b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(0.1))
+            b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(0.1))
+            b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(0.1))
+            b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(0.1))
+            b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(0.1))
+            b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(0.1))
+            b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(0.1))
+            b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(0.1))
 
-    if pooling == "pooled":
-        b0z = numpyro.sample("b0z", dist.Normal(0, 1.0))
-        b1z = numpyro.sample("b1z", dist.Normal(0, 1.0))  # ln(dbh)
-        b2z = numpyro.sample("b2z", dist.Normal(0, 1.0))  # dbh**2
-        b3z = numpyro.sample("b3z", NegativeLogNormal(0, 2.0))  # ln(site_index)
-        b4z = numpyro.sample("b4z", NegativeLogNormal(0, 2.0))  # slope
-        b5z = numpyro.sample("b5z", NegativeLogNormal(0, 2.0))  # elev
-        b6z = numpyro.sample("b6z", NegativeLogNormal(0, 2.0))  # crown_ratio
-        b7z = numpyro.sample("b7z", NegativeLogNormal(0, 2.0))  # comp_tree
-        # BAL / ln(dbh+1)
-        b8z = numpyro.sample("b8z", NegativeLogNormal(0, 2.0))  # comp_stand
-        # ln(BA)
-
-    elif pooling == "unpooled":
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(0, 1.0))
-            b1z = numpyro.sample("b1z", dist.Normal(0, 1.0))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(0, 1.0))  # dbh**2
-            b3z = numpyro.sample("b3z", NegativeLogNormal(0, 2.0))  # ln(site_index)
-            b4z = numpyro.sample("b4z", NegativeLogNormal(0, 2.0))  # slope
-            b5z = numpyro.sample("b5z", NegativeLogNormal(0, 2.0))  # elev
-            b6z = numpyro.sample("b6z", NegativeLogNormal(0, 2.0))  # crown_ratio
-            b7z = numpyro.sample("b7z", NegativeLogNormal(0, 2.0))  # comp_tree
-            # BAL / ln(dbh+1)
-            b8z = numpyro.sample("b8z", NegativeLogNormal(0, 2.0))  # comp_stand
-            # ln(BA)
-
-    elif pooling == "partial":
-        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(0, 1.0))
-        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0, 1.0))
-        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(0, 1.0))
-        b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0, 1.0))
-        b4z_mu = numpyro.sample("b4z_mu", dist.Normal(0, 1.0))
-        b5z_mu = numpyro.sample("b5z_mu", dist.Normal(0, 1.0))
-        b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0, 1.0))
-        b7z_mu = numpyro.sample("b7z_mu", dist.Normal(0, 1.0))
-        b8z_mu = numpyro.sample("b8z_mu", dist.Normal(0, 1.0))
-
-        b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
-        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(1.0))
-        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(1.0))
-        b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(1.0))
-        b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(1.0))
-        b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(1.0))
-        b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(1.0))
-        b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(1.0))
-        b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(1.0))
-
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
-            b1z = numpyro.sample("b1z", dist.Normal(b1z_mu, b1z_sd))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(b2z_mu, b2z_sd))  # dbh**2
-            b3z = numpyro.sample(
-                "b3z", NegativeLogNormal(b3z_mu, b3z_sd)
-            )  # ln(site_index)
-            b4z = numpyro.sample("b4z", NegativeLogNormal(b4z_mu, b4z_sd))  # slope
-            b5z = numpyro.sample("b5z", NegativeLogNormal(b5z_mu, b5z_sd))  # elev
-            b6z = numpyro.sample(
-                "b6z", NegativeLogNormal(b6z_mu, b6z_sd)
-            )  # crown_ratio
-            b7z = numpyro.sample(
-                "b7z", NegativeLogNormal(b7z_mu, b7z_sd)
-            )  # comp_tree  # BAL / ln(dbh+1)
-            b8z = numpyro.sample(
-                "b8z", NegativeLogNormal(b8z_mu, b8z_sd)
-            )  # comp_stand  # ln(BA)
-    else:
-        raise (
-            ValueError(
-                "valid options for pooling are 'unpooled', 'pooled', or 'partial'"
-            )
-        )
-
+            with plate_var:
+                b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
+                b1z = numpyro.sample("b1z", dist.Normal(b1z_mu, b1z_sd))  # ln(dbh)
+                b2z = numpyro.sample("b2z", dist.Normal(b2z_mu, b2z_sd))  # dbh**2
+                b3z = numpyro.sample("b3z", dist.Normal(b3z_mu, b3z_sd))  # ln(site_index)
+                b4z = numpyro.sample("b4z", dist.Normal(b4z_mu, b4z_sd))  # slope
+                b5z = numpyro.sample("b5z", dist.Normal(b5z_mu, b5z_sd))  # elev
+                b6z = numpyro.sample("b6z", dist.Normal(b6z_mu, b6z_sd))  # crown_ratio  
+                b7z = numpyro.sample("b7z", dist.Normal(b7z_mu, b7z_sd))  # tree_comp
+                b8z = numpyro.sample("b8z", dist.Normal(b8z_mu, b8z_sd))  # stand_comp
+                etree = numpyro.sample('etree', dist.InverseGamma(10., 5.)) # periodic (5-yr error)
+                
     b1 = numpyro.deterministic("b1", b1z / X_sd[0])
     b2 = numpyro.deterministic("b2", b2z / X_sd[1])
     b3 = numpyro.deterministic("b3", b3z / X_sd[2])
@@ -635,764 +1687,131 @@ def potential_modified_model(
     b6 = numpyro.deterministic("b6", b6z / X_sd[5])
     b7 = numpyro.deterministic("b7", b7z / X_sd[6])
     b8 = numpyro.deterministic("b8", b8z / X_sd[7])
-
-    adjust = b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8
+    
+    adjust = (
+        b1*X_mu[0] + b2*X_mu[1] + b3*X_mu[2] + b4*X_mu[3]
+        + b5*X_mu[4] + b6*X_mu[5] + b7*X_mu[6] + b8*X_mu[7]
+    )
     b0 = numpyro.deterministic("b0", b0z - adjust)
-
+    
     if loc_random:
-        with numpyro.plate("locations", num_locations - 1):
-            eloc_ = numpyro.sample(
-                "eloc", dist.Normal(0, 0.1)
-            )  # random location effect
-        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
-        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
+        with plate_spp:
+            with numpyro.plate("locations", num_locations - 1, dim=-1):
+                eloc_ = numpyro.sample(
+                    "eloc_", dist.Normal(0, 0.1)
+                )  # random location effect
+        eloc_last = -eloc_.sum(axis=1, keepdims=True)
+        eloc = numpyro.deterministic(
+            "eloc",
+            jnp.hstack([eloc_, eloc_last])
+        )
     else:
-        eloc = 0 * loc
+        eloc = jnp.zeros((num_species, num_locations))
 
-    if plot_random:
+    if plot_random: # not adding a separate plot effect for each species
         with numpyro.plate("plots", num_plots - 1):
             eplot_ = numpyro.sample(
-                "eplot", dist.Normal(0, 0.1)
+                "eplot_", dist.Normal(0, 0.1)
             )  # random effect of plot
-        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
-        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        eplot_last = -eplot_.sum()
+        eplot = numpyro.deterministic(
+            "eplot", 
+            jnp.concatenate([eplot_, eplot_last.reshape(-1)])
+        )
     else:
-        eplot = 0 * plot
-
-    def step(dbh, step_covars):
-        crown_ratio, comp_tree, comp_stand = step_covars
-        if pooling == "pooled":
-            size = b1 * jnp.log(dbh) + b2 * dbh**2
-            site = b3 * jnp.log(site_index) + b4 * slope + b5 * elev
-            comp = b6 * crown_ratio + b7 * comp_tree + b8 * comp_stand
-
-            ln_dds = b0 + size + site + comp + eloc[loc] + eplot[plot]
-
-        else:
-            size = b1[variant] * jnp.log(dbh) + b2[variant] * dbh**2
+        eplot = 0 * plot   
+    
+    def step(dbh0, t):
+        cr_ = crown_ratio[:, t]
+        if tree_comp == 'bal':
+            tree_var = bal[:, t]
+        elif tree_comp == 'ballndbh':
+            tree_var = bal[:, t] / jnp.log(dbh0 + 1.0)
+        else:  # tree_comp == 'relht':
+            tree_var = relht[:, t]
+        
+        if stand_comp == 'ba':
+            stand_var = bapa[:, t]
+        elif stand_comp == 'lnba':
+            stand_var = jnp.log(bapa[:, t])
+        else:  # stand_comp == 'ccf':
+            stand_var = ccf[:, t]
+        
+        if pooling == 'pooled':
+            size = b1[spp] * jnp.log(dbh0) + b2[spp] * dbh0**2
             site = (
-                b3[variant] * jnp.log(site_index)
-                + b4[variant] * slope
-                + b5[variant] * elev
+                b3[spp] * jnp.log(site_index) + b4[spp] * slope + b5[spp] * elev
             )
-            comp = (
-                b6[variant] * crown_ratio
-                + b7[variant] * comp_tree
-                + b8[variant] * comp_stand
-            )
+            comp = b6[spp] * cr_ + b7[spp] * tree_var + b8[spp] * stand_var
 
-            ln_dds = b0[variant] + size + site + comp + eloc[loc] + eplot[plot]
-
-        dds = jnp.exp(ln_dds)
-        dib_start = bark_b1 * dbh**bark_b2
-        dib_end = jnp.sqrt(dib_start**2 + dds)
-        dbh_end = (dib_end / bark_b1) ** (1 / bark_b2)
-        dg_ob = dbh_end - dbh
-
-        return dbh_end, dg_ob
-
-    step_covars = (crown_ratio, comp_tree, comp_stand)
-    dbh_end, growth = scan(step, dbh, step_covars, length=num_cycles)
-
-    dg_pred = numpyro.deterministic("dg_pred", dbh_end - dbh)
-    bai_pred = numpyro.deterministic("bai_pred", jnp.pi / 4 * (dbh_end**2 - dbh**2))
-
-    if target.lower() == "bai":
-        etree_bai = numpyro.sample("etree_bai", dist.Gamma(4.0, 0.1))
-        obs = numpyro.sample("obs", dist.Cauchy(bai_pred, etree_bai), obs=y)
-    elif target.lower() == "dg":
-        etree_dg = numpyro.sample("etree_dg", dist.InverseGamma(2.0, 0.25))
-        obs = numpyro.sample("obs", dist.Laplace(dg_pred, etree_dg), obs=y)
-
-    if y is not None:
-        if target.lower() == "bai":
-            bai_obs = y
-            dbh_end_obs = jnp.sqrt(4 / jnp.pi * bai_obs + dbh**2)
-            dg_obs = dbh_end_obs - dbh
-
-        elif target.lower() == "dg":
-            dg_obs = y
-            bai_obs = jnp.pi / 4 * ((dbh + dg_obs) ** 2 - dbh**2)
-
-        bai_resid = numpyro.deterministic("bai_resid", bai_pred - bai_obs)
-        bai_ss_res = ((bai_obs - bai_pred) ** 2).sum()
-        bai_ss_tot = ((bai_obs - bai_obs.mean()) ** 2).sum()
-        bai_r2 = numpyro.deterministic("bai_r2", 1 - bai_ss_res / bai_ss_tot)
-        bai_bias = numpyro.deterministic("bai_bias", bai_resid.mean())
-        bai_mae = numpyro.deterministic("bai_mae", jnp.abs(bai_resid).mean())
-        bai_rmse = numpyro.deterministic(
-            "bai_rmse", jnp.sqrt((bai_resid**2).sum() / num_trees)
-        )
-        dg_resid = numpyro.deterministic("dg_resid", dg_pred - dg_obs)
-        dg_ss_res = ((dg_obs - dg_pred) ** 2).sum()
-        dg_ss_tot = ((dg_obs - dg_obs.mean()) ** 2).sum()
-        dg_r2 = numpyro.deterministic("dg_r2", 1 - dg_ss_res / dg_ss_tot)
-        dg_bias = numpyro.deterministic("dg_bias", dg_resid.mean())
-        dg_mae = numpyro.deterministic("dg_mae", jnp.abs(dg_resid).mean())
-        dg_rmse = numpyro.deterministic(
-            "dg_rmse", jnp.sqrt((dg_resid**2).sum() / num_trees)
-        )
-
-
-def vslite_model(
-    data,
-    num_cycles,
-    bark_b1,
-    bark_b2,
-    num_variants,
-    num_locations,
-    num_plots,
-    y=None,
-    target="dg",
-    pooling="unpooled",
-    loc_random=False,
-    plot_random=False,
-):
-    """A recursive model that predicts diameter growth or basal area increment
-    for individual trees adapted from the general form of Wykoff (1990), with
-    annualization inspired by Cao (2000, 2004), and mixed effects approach
-    illustrated by Weiskittel et al., (2007).
-
-    The Wykoff model employs a linear model to predict the log of the
-    difference between squared inside-bark diameter from one timestep to the
-    next. A mixed effects model form is used, with fixed effect for tree size,
-    site variables, and competition variables, and random effects for each
-    location, and for each plot. The Wykoff model has been modified to follow
-    a "POTENTIAL * MODIFIER" form where potential diameter growth is now
-    estimated from the intercept and fixed effects of tree size. All other
-    fixed effects have been transformed such that increasing magnitude of the
-    predictor variable should correspond to decreased growth. The coefficients
-    for these features are then constrained to be negative.
-
-    The model can be fit using an arbitrary number of time steps, and with
-    three alternatives to incorporate hierarchical model structure across
-    ecoregions: fully pooled, fully unpooled, and partially pooled. The
-    likelihood for the model is calculated from the periodic outside-bark
-    diameter growth using a Cauchy distribution to as a form of robust
-    regression to help reduce the influence of extreme growth observations
-    (both negative and positive) compared to a Normal likelihood.
-
-    Parameters
-    ----------
-    data : list-like
-      predictor variables, expected in the following order:
-          1. variant_index
-          2. location_index
-          3. plot_index
-          4. site_index
-          5. slope, in percent, where 100% slope = 1.0
-          6. elevation
-          7. dbh
-          8. crown_ratio_start, as a proportion, where 100% = 1.0
-          9. crown_ratio_end, as a proportion, where 100% = 1.0
-          10. competition_treelevel_start
-          11. competition_treelevel_end
-          12. competition_standlevel_start
-          13. competition_standlevel_end
-          14. solar radiation (monthly)
-          15. soil moisture (monthly)
-          16. average temperature (monthly)
-    num_cycles : int
-      number of steps (or cycles) of growth to simulate
-    bark_b1, bark_b2 : scalar
-      coefficients used to convert diameter outside bark to diameter inside
-      bark, as DIB = b1*(DBH**b2)
-    num_variants : int
-      number of distinct variants or ecoregions across dataset
-    num_locations : int
-      number of distinct locations across dataset, modeled as a random effect
-    num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
-    y : scalar or list-like
-      observed outside-bark diameter growth
-    target : str
-      type of target variable, may be 'bai' or 'dg'
-    pooling : str
-      degree of pooling for model covariates across variants/ecoregions, valid
-      are 'unpooled', 'pooled', or 'partial'.
-    """
-
-    (
-        variant,
-        loc,
-        plot,
-        site_index,
-        slope,
-        elev,
-        dbh,
-        cr_start,
-        cr_end,
-        comp_tree_start,
-        comp_tree_end,
-        comp_stand_start,
-        comp_stand_end,
-        solar,
-        moisture,
-        temp,
-    ) = data
-
-    dbh = jnp.asarray(dbh).reshape(-1)
-    y = jnp.asarray(y).reshape(-1)
-    num_trees = dbh.size
-    variant = jnp.asarray(variant).reshape(-1)
-    loc = jnp.asarray(loc).reshape(-1)
-    plot = jnp.asarray(plot).reshape(-1)
-    site_index = 250 / jnp.asarray(site_index).reshape(-1)
-    slope = jnp.asarray(slope).reshape(-1)
-    elev = jnp.asarray(elev).reshape(-1)
-    crown_ratio = jnp.linspace(1 - cr_start, 1 - cr_end, num_cycles)
-    comp_tree = jnp.linspace(comp_tree_start, comp_tree_end, num_cycles)
-    comp_stand = jnp.linspace(comp_stand_start, comp_stand_end, num_cycles)
-    solar = jnp.moveaxis(solar, 0, -1)
-    moisture = jnp.moveaxis(moisture, 0, -1)
-    temp = jnp.moveaxis(temp, 0, -1)
-
-    X = jnp.array(
-        [
-            jnp.log(dbh),
-            dbh**2,
-            jnp.log(site_index),
-            slope,
-            elev,
-            1 - cr_start,
-            comp_tree_start,
-            comp_stand_start,
-        ]
-    )
-    X_mu = X.mean(axis=1)
-    X_sd = X.std(axis=1)
-
-    if pooling == "pooled":
-        b0z = numpyro.sample("b0z", dist.Normal(0.0, 1.0))
-        b1z = numpyro.sample("b1z", dist.Normal(0.0, 1.0))  # ln(dbh)
-        b2z = numpyro.sample("b2z", dist.Normal(0.0, 1.0))  # dbh**2
-        b3z = numpyro.sample("b3z", NegativeLogNormal(0.0, 2.0))  # ln(site_index)
-        b4z = numpyro.sample("b4z", NegativeLogNormal(0.0, 2.0))  # slope
-        # b5z = numpyro.sample('b5z', dist.Normal(0., 1.0))  # elev
-        b6z = numpyro.sample("b6z", NegativeLogNormal(0.0, 2.0))  # crown_ratio
-        b7z = numpyro.sample(
-            "b7z", NegativeLogNormal(0.0, 2.0)
-        )  # comp_tree  # BAL / ln(dbh+1)
-        b8z = numpyro.sample("b8z", NegativeLogNormal(0.0, 2.0))  # comp_stand  # ln(BA)
-
-        m1 = numpyro.sample("m1", AffineBeta(1.5, 2.8, 0.0, 0.1))
-        m2 = numpyro.sample("m2", AffineBeta(1.5, 2.5, 0.1, 0.7))
-        t1 = numpyro.sample("t1", AffineBeta(9.0, 5.0, 0.0, 9.0))
-        t2 = numpyro.sample("t2", AffineBeta(3.5, 3.5, 10.0, 14.0))
-
-    elif pooling == "unpooled":
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(0.0, 1.0))
-            b1z = numpyro.sample("b1z", dist.Normal(0.0, 1.0))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(0.0, 1.0))  # dbh**2
-            b3z = numpyro.sample("b3z", NegativeLogNormal(0.0, 2.0))  # ln(site_index)
-            b4z = numpyro.sample("b4z", NegativeLogNormal(0.0, 2.0))  # slope
-            # b5z = numpyro.sample('b5z', NegativeHalfNormal(2))  # elev
-            b6z = numpyro.sample("b6z", NegativeLogNormal(0.0, 2.0))  # crown_ratio
-            b7z = numpyro.sample(
-                "b7z", dist.Normal(0.0, 1.0)
-            )  # comp_tree  # BAL / ln(dbh+1)
-            b8z = numpyro.sample(
-                "b8z", NegativeLogNormal(0.0, 2.0)
-            )  # comp_stand  # ln(BA)
-
-            m1 = numpyro.sample("m1", AffineBeta(1.5, 2.8, 0.0, 0.1))
-            m2 = numpyro.sample("m2", AffineBeta(1.5, 2.5, 0.1, 0.7))
-            t1 = numpyro.sample("t1", AffineBeta(9.0, 5.0, 0.0, 9.0))
-            t2 = numpyro.sample("t2", AffineBeta(3.5, 3.5, 10.0, 14.0))
-
-    elif pooling == "partial":
-        b0z_mu = numpyro.sample("b0z_mu", dist.Normal(0, 1.0))
-        b1z_mu = numpyro.sample("b1z_mu", dist.Normal(0, 1.0))
-        b2z_mu = numpyro.sample("b2z_mu", dist.Normal(0, 1.0))
-        b3z_mu = numpyro.sample("b3z_mu", dist.Normal(0, 1.0))
-        b4z_mu = numpyro.sample("b4z_mu", dist.Normal(0, 1.0))
-        b5z_mu = numpyro.sample("b5z_mu", dist.Normal(0, 1.0))
-        b6z_mu = numpyro.sample("b6z_mu", dist.Normal(0, 1.0))
-        b7z_mu = numpyro.sample("b7z_mu", dist.Normal(0, 1.0))
-        b8z_mu = numpyro.sample("b8z_mu", dist.Normal(0, 1.0))
-
-        b0z_sd = numpyro.sample("b0z_sd", dist.HalfNormal(1.0))
-        b1z_sd = numpyro.sample("b1z_sd", dist.HalfNormal(1.0))
-        b2z_sd = numpyro.sample("b2z_sd", dist.HalfNormal(1.0))
-        b3z_sd = numpyro.sample("b3z_sd", dist.HalfNormal(1.0))
-        b4z_sd = numpyro.sample("b4z_sd", dist.HalfNormal(1.0))
-        b5z_sd = numpyro.sample("b5z_sd", dist.HalfNormal(1.0))
-        b6z_sd = numpyro.sample("b6z_sd", dist.HalfNormal(1.0))
-        b7z_sd = numpyro.sample("b7z_sd", dist.HalfNormal(1.0))
-        b8z_sd = numpyro.sample("b8z_sd", dist.HalfNormal(1.0))
-
-        m1_conc1 = numpyro.sample("m1_conc1", dist.Gamma(100, 67))
-        m1_conc2 = numpyro.sample("m1_conc2", dist.Gamma(350, 125))
-        m2_conc1 = numpyro.sample("m2_conc1", dist.Gamma(100, 67))
-        m2_conc2 = numpyro.sample("m2_conc2", dist.Gamma(275, 110))
-        t1_conc1 = numpyro.sample("t1_conc1", dist.Gamma(81.0, 9.0))
-        t1_conc2 = numpyro.sample("t1_conc2", dist.Gamma(25.0, 5.0))
-        t2_conc1 = numpyro.sample("t2_conc1", dist.Gamma(12.25, 3.5))
-        t2_conc2 = numpyro.sample("t2_conc2", dist.Gamma(12.25, 3.5))
-
-        with numpyro.plate("variants", num_variants):
-            b0z = numpyro.sample("b0z", dist.Normal(b0z_mu, b0z_sd))
-            b1z = numpyro.sample("b1z", dist.Normal(b1z_mu, b1z_sd))  # ln(dbh)
-            b2z = numpyro.sample("b2z", dist.Normal(b2z_mu, b2z_sd))  # dbh**2
-            b3z = numpyro.sample(
-                "b3z", NegativeLogNormal(b3z_mu, b3z_sd)
-            )  # ln(site_index)
-            b4z = numpyro.sample("b4z", NegativeLogNormal(b4z_mu, b4z_sd))  # slope
-            b5z = numpyro.sample("b5z", NegativeLogNormal(b5z_mu, b5z_sd))  # elev
-            b6z = numpyro.sample(
-                "b6z", NegativeLogNormal(b6z_mu, b6z_sd)
-            )  # crown_ratio
-            b7z = numpyro.sample(
-                "b7z", NegativeLogNormal(b7z_mu, b7z_sd)
-            )  # comp_tree  # BAL / ln(dbh+1)
-            b8z = numpyro.sample(
-                "b8z", NegativeLogNormal(b8z_mu, b8z_sd)
-            )  # comp_stand  # ln(BA)
-
-            m1 = numpyro.sample("m1", AffineBeta(m1_conc1, m1_conc2, 0.0, 0.1))
-            m2 = numpyro.sample("m2", AffineBeta(m2_conc1, m2_conc2, 0.1, 0.7))
-            t1 = numpyro.sample("t1", AffineBeta(t1_conc1, t1_conc2, 0.0, 7.0))
-            t2 = numpyro.sample("t2", AffineBeta(t2_conc1, t2_conc2, 7.0, 17.0))
-    else:
-        raise (
-            ValueError(
-                "valid options for pooling are 'unpooled', 'pooled', or 'partial'"
-            )
-        )
-
-    b1 = numpyro.deterministic("b1", b1z / X_sd[0])
-    b2 = numpyro.deterministic("b2", b2z / X_sd[1])
-    b3 = numpyro.deterministic("b3", b3z / X_sd[2])
-    b4 = numpyro.deterministic("b4", b4z / X_sd[3])
-    # b5 = numpyro.deterministic('b5', b5z/X_sd[4])
-    b5 = 0.0
-    b6 = numpyro.deterministic("b6", b6z / X_sd[5])
-    b7 = numpyro.deterministic("b7", b7z / X_sd[6])
-    b8 = numpyro.deterministic("b8", b8z / X_sd[7])
-
-    adjust = b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8
-    b0 = numpyro.deterministic("b0", b0z - adjust)
-
-    if loc_random:
-        with numpyro.plate("locations", num_locations - 1):
-            eloc_ = numpyro.sample(
-                "eloc", dist.Normal(0, 0.1)
-            )  # random location effect
-        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
-        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
-    else:
-        eloc = 0 * loc
-
-    if plot_random:
-        with numpyro.plate("plots", num_plots - 1):
-            eplot_ = numpyro.sample(
-                "eplot", dist.Normal(0, 0.1)
-            )  # random effect of plot
-        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
-        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
-    else:
-        eplot = 0 * plot
-
-    def step(dbh, step_covars):
-        crown_ratio, comp_tree, comp_stand, solar, moisture, temp = step_covars
-        if pooling == "pooled":
-            size = b1 * jnp.log(dbh) + b2 * dbh**2
-            site = b3 * jnp.log(site_index) + b4 * slope  # + b5 * elev # drop elevation
-            comp = b6 * crown_ratio + b7 * comp_tree + b8 * comp_stand
-            fm = (moisture - m1) / (m2 - m1)
-            fm = 1 / (1 + jnp.exp(-6 * (fm - 0.5)))
-            ft = (temp - t1) / (t2 - t1)
-            ft = 1 / (1 + jnp.exp(-6 * (ft - 0.5)))
-
-            clim = jnp.log(
-                (solar * jnp.minimum(ft, fm)).sum(axis=0) / solar.sum(axis=0)
-            )
-
-            ln_dds = b0 + size + site + comp + clim + eloc[loc] + eplot[plot]
-
+            ln_dds_ = b0[spp] + size + site + comp + eloc[spp, location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[spp]))
+        
         else:
-            size = b1[variant] * jnp.log(dbh) + b2[variant] * dbh**2
+            size = b1[spp, variant] * jnp.log(dbh0) + b2[spp, variant] * dbh0**2
             site = (
-                b3[variant] * jnp.log(site_index)
-                + b4[variant] * slope  # +
-                # b5[variant] * elev  # drop elevation
+                b3[spp, variant] * jnp.log(site_index) + b4[spp, variant] * slope 
+                + b5[spp, variant] * elev
             )
-            comp = (
-                b6[variant] * crown_ratio
-                + b7[variant] * comp_tree
-                + b8[variant] * comp_stand
-            )
+            comp = b6[spp, variant] * cr_ + b7[spp, variant] * tree_var + b8[spp, variant] * stand_var
 
-            fm = (moisture - m1[variant]) / (m2[variant] - m1[variant])
-            fm = 1 / (1 + jnp.exp(-6 * (fm - 0.5)))
-            ft = (temp - t1[variant]) / (t2[variant] - t1[variant])
-            ft = 1 / (1 + jnp.exp(-6 * (ft - 0.5)))
-            clim = jnp.log(
-                (solar * jnp.minimum(ft, fm)).sum(axis=0) / solar.sum(axis=0)
-            )
-
-            ln_dds = b0[variant] + size + site + comp + clim + eloc[loc] + eplot[plot]
-
+            ln_dds_ = b0[spp, variant] + size + site + comp + eloc[spp, location] + eplot[plot]
+            ln_dds = numpyro.sample('ln_dds', dist.Normal(ln_dds_, etree[spp, variant]))
+        
         dds = jnp.exp(ln_dds)
-        dib_start = bark_b1 * dbh**bark_b2
-        dib_end = jnp.sqrt(dib_start**2 + dds)
-        dbh_end = (dib_end / bark_b1) ** (1 / bark_b2)
-        dg_ob = dbh_end - dbh
+        dib0 = bark_b0[spp] + bark_b1[spp] * dbh0**bark_b2[spp]
+        dib1 = jnp.sqrt(dib0**2 + dds)
+        radial_increment = (dib1 - dib0)/2
+        dbh1 = ((dib1 - bark_b0[spp]) / bark_b1[spp]) ** (1 / bark_b2[spp])
 
-        return dbh_end, dg_ob
-
-    step_covars = (crown_ratio, comp_tree, comp_stand, solar, moisture, temp)
-    dbh_end, growth = scan(step, dbh, step_covars, length=num_cycles)
-
-    dg_pred = numpyro.deterministic("dg_pred", dbh_end - dbh)
-    bai_pred = numpyro.deterministic("bai_pred", jnp.pi / 4 * (dbh_end**2 - dbh**2))
-
-    if target.lower() == "bai":
-        etree_bai = numpyro.sample("etree_bai", dist.Gamma(4.0, 0.1))
-        obs = numpyro.sample("obs", dist.Cauchy(bai_pred, etree_bai), obs=y)
-    elif target.lower() == "dg":
-        etree_dg = numpyro.sample("etree_dg", dist.InverseGamma(2.0, 0.25))
-        obs = numpyro.sample("obs", dist.Laplace(dg_pred, etree_dg), obs=y)
-
-    if y is not None:
-        if target.lower() == "bai":
-            bai_obs = y
-            dbh_end_obs = jnp.sqrt(4 / jnp.pi * bai_obs + dbh**2)
-            dg_obs = dbh_end_obs - dbh
-
-        elif target.lower() == "dg":
-            dg_obs = y
-            bai_obs = jnp.pi / 4 * ((dbh + dg_obs) ** 2 - dbh**2)
-
-        bai_resid = numpyro.deterministic("bai_resid", bai_pred - bai_obs)
-        bai_ss_res = ((bai_obs - bai_pred) ** 2).sum()
-        bai_ss_tot = ((bai_obs - bai_obs.mean()) ** 2).sum()
-        bai_r2 = numpyro.deterministic("bai_r2", 1 - bai_ss_res / bai_ss_tot)
-        bai_bias = numpyro.deterministic("bai_bias", bai_resid.mean())
-        bai_mae = numpyro.deterministic("bai_mae", jnp.abs(bai_resid).mean())
-        bai_rmse = numpyro.deterministic(
-            "bai_rmse", jnp.sqrt((bai_resid**2).sum() / num_trees)
-        )
-        dg_resid = numpyro.deterministic("dg_resid", dg_pred - dg_obs)
-        dg_ss_res = ((dg_obs - dg_pred) ** 2).sum()
-        dg_ss_tot = ((dg_obs - dg_obs.mean()) ** 2).sum()
-        dg_r2 = numpyro.deterministic("dg_r2", 1 - dg_ss_res / dg_ss_tot)
-        dg_bias = numpyro.deterministic("dg_bias", dg_resid.mean())
-        dg_mae = numpyro.deterministic("dg_mae", jnp.abs(dg_resid).mean())
-        dg_rmse = numpyro.deterministic(
-            "dg_rmse", jnp.sqrt((dg_resid**2).sum() / num_trees)
-        )
-
-
-def threepg_model(
-    data,
-    num_cycles,
-    bark_b1,
-    bark_b2,
-    num_variants,
-    num_locations,
-    num_plots,
-    y=None,
-    target="dg",
-    pooling="unpooled",
-    loc_random=False,
-    plot_random=False,
-):
-    """A recursive model that predicts diameter growth or basal area increment
-    for individual trees adapted from the general form of Wykoff (1990), with
-    annualization inspired by Cao (2000, 2004), and mixed effects approach
-    illustrated by Weiskittel et al., (2007).
-
-    The Wykoff model employs a linear model to predict the log of the
-    difference between squared inside-bark diameter from one timestep to the
-    next. A mixed effects model form is used, with fixed effect for tree size,
-    site variables, and competition variables, and random effects for each
-    location, and for each plot. The Wykoff model has been modified to follow
-    a "POTENTIAL * MODIFIER" form where potential diameter growth is now
-    estimated from the intercept and fixed effects of tree size. All other
-    fixed effects have been transformed such that increasing magnitude of the
-    predictor variable should correspond to decreased growth. The coefficients
-    for these features are then constrained to be negative.
-
-    The model can be fit using an arbitrary number of time steps, and with
-    three alternatives to incorporate hierarchical model structure across
-    ecoregions: fully pooled, fully unpooled, and partially pooled. The
-    likelihood for the model is calculated from the periodic outside-bark
-    diameter growth using a Cauchy distribution to as a form of robust
-    regression to help reduce the influence of extreme growth observations
-    (both negative and positive) compared to a Normal likelihood.
-
-    Parameters
-    ----------
-    data : list-like
-      predictor variables, expected in the following order:
-          1. variant_index
-          2. location_index
-          3. plot_index
-          4. site_index
-          5. slope, in percent, where 100% slope = 1.0
-          6. elevation
-          7. dbh
-          8. crown_ratio_start, as a proportion, where 100% = 1.0
-          9. crown_ratio_end, as a proportion, where 100% = 1.0
-          10. competition_treelevel_start
-          11. competition_treelevel_end
-          12. competition_standlevel_start
-          13. competition_standlevel_end
-          14. solar radiation (monthly)
-          15. soil moisture (monthly)
-          16. average temperature (monthly)
-          17. vapor pressure deficit (monthly)
-          18. number of frost free days (monthly)
-    num_cycles : int
-      number of steps (or cycles) of growth to simulate
-    bark_b1, bark_b2 : scalar
-      coefficients used to convert diameter outside bark to diameter inside
-      bark, as DIB = b1*(DBH**b2)
-    num_variants : int
-      number of distinct variants or ecoregions across dataset
-    num_locations : int
-      number of distinct locations across dataset, modeled as a random effect
-    num_plots : int
-      number of distinct plots across dataset, modeled as a random effect
-    y : scalar or list-like
-      observed outside-bark diameter growth
-    target : str
-      type of target variable, may be 'bai' or 'dg'
-    pooling : str
-      degree of pooling for model covariates across variants/ecoregions, valid
-      are 'unpooled', 'pooled', or 'partial'.
-    """
-
-    (
-        variant,
-        loc,
-        plot,
-        site_index,
-        slope,
-        elev,
-        dbh,
-        cr_start,
-        cr_end,
-        comp_tree_start,
-        comp_tree_end,
-        comp_stand_start,
-        comp_stand_end,
-        solar,
-        moisture,
-        temp,
-        vpd,
-        nffd,
-    ) = data
-
-    dbh = jnp.asarray(dbh).reshape(-1)
-    y = jnp.asarray(y).reshape(-1)
-    num_trees = dbh.size
-    variant = jnp.asarray(variant).reshape(-1)
-    loc = jnp.asarray(loc).reshape(-1)
-    plot = jnp.asarray(plot).reshape(-1)
-    site_index = 250 / jnp.asarray(site_index).reshape(-1)
-    slope = jnp.asarray(slope).reshape(-1)
-    elev = jnp.asarray(elev).reshape(-1)
-    crown_ratio = jnp.linspace(1 - cr_start, 1 - cr_end, num_cycles)
-    comp_tree = jnp.linspace(comp_tree_start, comp_tree_end, num_cycles)
-    comp_stand = jnp.linspace(comp_stand_start, comp_stand_end, num_cycles)
-    solar = jnp.moveaxis(solar, 0, -1)
-    moisture = jnp.moveaxis(moisture, 0, -1)
-    temp = jnp.moveaxis(temp, 0, -1)
-    vpd = jnp.moveaxis(vpd, 0, -1)
-    nffd = jnp.moveaxis(nffd, 0, -1)
-
-    X = jnp.array(
-        [
-            jnp.log(dbh),
-            dbh**2,
-            jnp.log(site_index),
-            slope,
-            elev,
-            1 - cr_start,
-            comp_tree_start,
-            comp_stand_start,
-        ]
+        return dbh1, (radial_increment, dbh1)
+    
+    # incorporate measurement error into DBH records
+    # assuming FIA meets measurement quality objectives
+    # dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, dbh/20.*0.1/1.65)) 
+    
+    # best estimate of DBH meas error in PNW from Melson et al. (2002)
+    # Melson estimate is about 3.75 times larger than FIA MQO
+    # error is exponentially distributed, b[0]*dbh**b[1], b=[1.33145993e-04, 2.17862018e+00]
+    dbh_start = numpyro.sample('dbh_start', dist.Normal(dbh, 0.01*dbh))
+    
+    dbh_end, (radial_growth, dbh_series) = scan(step, dbh_start, jnp.arange(num_cycles))
+    
+    real_dbh = numpyro.deterministic(
+        'real_dbh',
+        jnp.hstack((dbh_start.reshape(-1, 1), dbh_series.T))
     )
-    X_mu = X.mean(axis=1)
-    X_sd = X.std(axis=1)
-    bsolar = numpyro.sample("bsolar", dist.Normal(0.0, 1.0))
-
-    if pooling == "pooled":
-        b0z = numpyro.sample("b0z", dist.Normal(0.7, 2.0))
-        b1z = numpyro.sample("b1z", dist.Normal(0.8, 1.0))  # ln(dbh)
-        b2z = numpyro.sample("b2z", dist.Normal(-0.1, 1.0))  # dbh**2
-        b3z = numpyro.sample("b3z", NegativeHalfNormal(2))  # ln(site_index)
-        b4z = numpyro.sample("b4z", NegativeHalfNormal(2))  # slope
-        # b5z = numpyro.sample('b5z', NegativeHalfNormal(2))  # elev
-        b6z = numpyro.sample("b6z", NegativeHalfNormal(2))  # crown_ratio
-        b7z = numpyro.sample(
-            "b7z", NegativeHalfNormal(2)
-        )  # comp_tree  # BAL / ln(dbh+1)
-        b8z = numpyro.sample("b8z", NegativeHalfNormal(2))  # comp_stand  # ln(BA)
-
-        m1 = numpyro.sample("m1", AffineBeta(1.5, 2.8, 0.0, 0.2))
-        m2 = numpyro.sample("m2", AffineBeta(1.5, 2.5, 0.2, 0.7))
-        tmin = numpyro.sample("tmin", AffineBeta(9.0, 5.0, 0.0, 9.0))
-        topt = numpyro.sample("tmax", AffineBeta(3.5, 3.5, 10.0, 14.0))
-        tmax = numpyro.sample("topt", AffineBeta(3.5, 3.5, 10.0, 14.0))
-        vpd_coef = numpyro.sample("vpd_coef", AffineBeta(3.5, 3.5, 10.0, 14.0))
-        sw_const = numpyro.sample("sw_const", AffineBeta(3.5, 3.5, 10.0, 14.0))
-        sw_pow = numpyro.sample("sw_pow", AffineBeta(3.5, 3.5, 10.0, 14.0))
-
-    elif pooling == "unpooled":
-        with numpyro.plate("variants", num_variants):
-            pass
-            # TO DO
-
-    elif pooling == "partial":
-        pass
-        # TO DO
-
-        with numpyro.plate("variants", num_variants):
-            pass
-            # TO DO
-    else:
-        raise (
-            ValueError(
-                "valid options for pooling are 'unpooled', 'pooled', or 'partial'"
-            )
-        )
-
-    b1 = numpyro.deterministic("b1", b1z / X_sd[0])
-    b2 = numpyro.deterministic("b2", b2z / X_sd[1])
-    b3 = numpyro.deterministic("b3", b3z / X_sd[2])
-    b4 = numpyro.deterministic("b4", b4z / X_sd[3])
-    # b5 = numpyro.deterministic('b5', b5z/X_sd[4])
-    b5 = 0.0
-    b6 = numpyro.deterministic("b6", b6z / X_sd[5])
-    b7 = numpyro.deterministic("b7", b7z / X_sd[6])
-    b8 = numpyro.deterministic("b8", b8z / X_sd[7])
-
-    adjust = b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8
-    b0 = numpyro.deterministic("b0", b0z - adjust)
-
-    if loc_random:
-        with numpyro.plate("locations", num_locations - 1):
-            eloc_ = numpyro.sample(
-                "eloc", dist.Normal(0, 0.1)
-            )  # random location effect
-        eloc_last = numpyro.deterministic("eloc_last", -eloc_.sum())
-        eloc = jnp.concatenate([eloc_, eloc_last.reshape(-1)])
-    else:
-        eloc = 0 * loc
-
-    if plot_random:
-        with numpyro.plate("plots", num_plots - 1):
-            eplot_ = numpyro.sample(
-                "eplot", dist.Normal(0, 0.1)
-            )  # random effect of plot
-        eplot_last = numpyro.deterministic("eplot_last", -eplot_.sum())
-        eplot = jnp.concatenate([eplot_, eplot_last.reshape(-1)])
-    else:
-        eplot = 0 * plot
-
-    def step(dbh, step_covars):
-        crown_ratio, comp_tree, comp_stand, solar, moisture, temp = step_covars
-        if pooling == "pooled":
-            size = b1 * jnp.log(dbh) + b2 * dbh**2
-            site = b3 * jnp.log(site_index) + b4 * slope  # + b5 * elev # drop elevation
-            comp = b6 * crown_ratio + b7 * comp_tree + b8 * comp_stand
-
-            # ft = calc_modifier_temp(temp, tmin, tmax, topt)
-            # fd = calc_modifier_vpd(vpd, vpd_coef)
-            # fs = calc_modifier_soilwater(moisture, sw_const, sw_pow)
-            clim = 0
-
-            ln_dds = b0 + size + site + comp + clim + eloc[loc] + eplot[plot]
-
-        else:
-            size = b1[variant] * jnp.log(dbh) + b2[variant] * dbh**2
-            site = (
-                b3[variant] * jnp.log(site_index)
-                + b4[variant] * slope  # +
-                # b5[variant] * elev  # drop elevation
-            )
-            comp = (
-                b6[variant] * crown_ratio
-                + b7[variant] * comp_tree
-                + b8[variant] * comp_stand
-            )
-
-            # ft = calc_modifier_temp(temp, tmin, tmax, topt)
-            # fd = calc_modifier_vpd(vpd, vpd_coef)
-            # fs = calc_modifier_soilwater(moisture, sw_const, sw_pow)
-            clim = 0
-
-            ln_dds = b0[variant] + size + site + comp + clim + eloc[loc] + eplot[plot]
-
-        dds = jnp.exp(ln_dds)
-        dib_start = bark_b1 * dbh**bark_b2
-        dib_end = jnp.sqrt(dib_start**2 + dds)
-        dbh_end = (dib_end / bark_b1) ** (1 / bark_b2)
-        dg_ob = dbh_end - dbh
-
-        return dbh_end, dg_ob
-
-    step_covars = (crown_ratio, comp_tree, comp_stand, solar, moisture, temp)
-    dbh_end, growth = scan(step, dbh, step_covars, length=num_cycles)
-
-    dg_pred = numpyro.deterministic("dg_pred", dbh_end - dbh)
-    bai_pred = numpyro.deterministic("bai_pred", jnp.pi / 4 * (dbh_end**2 - dbh**2))
-
-    if target.lower() == "bai":
-        etree_bai = numpyro.sample("etree_bai", dist.Gamma(4.0, 0.1))
-        obs = numpyro.sample("obs", dist.Cauchy(bai_pred, etree_bai), obs=y)
-    elif target.lower() == "dg":
-        etree_dg = numpyro.sample("etree_dg", dist.InverseGamma(2.0, 0.25))
-        obs = numpyro.sample("obs", dist.Laplace(dg_pred, etree_dg), obs=y)
-
-    if y is not None:
-        if target.lower() == "bai":
-            bai_obs = y
-            dbh_end_obs = jnp.sqrt(4 / jnp.pi * bai_obs + dbh**2)
-            dg_obs = dbh_end_obs - dbh
-
-        elif target.lower() == "dg":
-            dg_obs = y
-            bai_obs = jnp.pi / 4 * ((dbh + dg_obs) ** 2 - dbh**2)
-
-        bai_resid = numpyro.deterministic("bai_resid", bai_pred - bai_obs)
-        bai_ss_res = ((bai_obs - bai_pred) ** 2).sum()
-        bai_ss_tot = ((bai_obs - bai_obs.mean()) ** 2).sum()
-        bai_r2 = numpyro.deterministic("bai_r2", 1 - bai_ss_res / bai_ss_tot)
-        bai_bias = numpyro.deterministic("bai_bias", bai_resid.mean())
-        bai_mae = numpyro.deterministic("bai_mae", jnp.abs(bai_resid).mean())
-        bai_rmse = numpyro.deterministic(
-            "bai_rmse", jnp.sqrt((bai_resid**2).sum() / num_trees)
-        )
-        dg_resid = numpyro.deterministic("dg_resid", dg_pred - dg_obs)
-        dg_ss_res = ((dg_obs - dg_pred) ** 2).sum()
-        dg_ss_tot = ((dg_obs - dg_obs.mean()) ** 2).sum()
-        dg_r2 = numpyro.deterministic("dg_r2", 1 - dg_ss_res / dg_ss_tot)
-        dg_bias = numpyro.deterministic("dg_bias", dg_resid.mean())
-        dg_mae = numpyro.deterministic("dg_mae", jnp.abs(dg_resid).mean())
-        dg_rmse = numpyro.deterministic(
-            "dg_rmse", jnp.sqrt((dg_resid**2).sum() / num_trees)
-        )
-
-
-def calc_modifier_temp(t, tmin, tmax, topt):
-    res = ((t - tmin) / (topt - tmin)) * ((tmax - t) / (tmax - topt)) ** (
-        (tmax - topt) / (topt - tmin)
+    meas_dbh_next = numpyro.sample(
+        'meas_dbh_next', 
+        # assuming FIA meets measurement quality objectives
+        # dist.Normal(real_dbh[:, 2], real_dbh[:, 2]/20.*0.1/1.65), 
+        # best estimate of DBH meas error in PNW from Melson et al. (2002)
+        # Melson estimate is about 3.75 times larger than FIA MQO
+        dist.Normal(real_dbh[:, 2], 0.01*real_dbh[:, 2]), 
+        obs=dbh_next
+        # to convert into annualized timestep where observations may or 
+        # may not be available in each year, use something like this...
+        # dist.Normal(
+        #     dbh_series[year_obs, tree_obs], 
+        #     dbh_series[year_obs, tree_obs]*.01
+        # ),
+        # obs=dbh_obs[tree_obs, year_obs]
     )
-    return jnp.clip(res, 0, 1)
 
+    meas_5yr = numpyro.sample(
+        'meas_5yr', 
+        dist.Normal(
+            radial_growth[1, exist_5yr], 
+            radial_growth[1, exist_5yr]/20./1.65
+        ),
+        obs=obs_5yr[exist_5yr]
+    )
 
-def calc_modifier_vpd(vpd, coef):
-    return jnp.exp(-1 * coef * vpd)
-
-
-def calc_modifier_soilwater(moisture, const=0.7, power=9):
-    return 1 / (1 + ((1 - moisture) / const) ** power)
-
-
-def calc_modifier_frost(nffd, k):
-    return 1 - k * (nffd / 30.0)
+    meas_10yr = numpyro.sample(
+        'meas_10yr', 
+        dist.Normal(
+            radial_growth[:2, exist_10yr].sum(axis=0), 
+            radial_growth[:2, exist_10yr].sum(axis=0)/20./1.65
+        ),
+        obs=obs_10yr[exist_10yr]
+    )
